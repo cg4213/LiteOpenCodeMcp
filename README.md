@@ -133,6 +133,9 @@ Returns a structured result including:
 - `cancel_requested`
 - `cancel_signal_sent`
 - `cancel_kill_sent`
+- `process_tree_kill_attempted`
+- `process_tree_kill_succeeded`
+- `process_tree_kill_error`
 
 Finished jobs are retained in memory for at least
 `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS` seconds. The default is `3600`.
@@ -173,7 +176,7 @@ Behavior:
   signal is sent.
 - Running jobs are marked with `cancel_requested=true`, then the wrapper sends
   `process.terminate()` to the OpenCode process and waits briefly. If the process is
-  still alive, it sends `process.kill()`.
+  still alive, it attempts best-effort process-tree cleanup.
 - Cancelled jobs finish with `status="cancelled"` and `success=false`. The
   `exit_code` field keeps the actual process exit code.
 
@@ -182,11 +185,19 @@ Additional cancel fields:
 - `cancel_requested`
 - `cancel_signal_sent`
 - `cancel_kill_sent`
+- `process_tree_kill_attempted`
+- `process_tree_kill_succeeded`
+- `process_tree_kill_error`
 
-Cancel is best-effort main-process termination. It does not perform full process-tree
-cleanup and does not roll back file changes. Callers should inspect
-`new_changed_files`, `all_changed_files`, and `policy_violation` to review any
-changes that happened before cancellation.
+Cancel is best-effort. The wrapper only targets the process it started and, if
+needed, that process tree; it never scans by `working_dir` or kills unrelated
+processes. On Windows, the fallback tree cleanup uses `taskkill /PID <pid> /T /F`
+through `subprocess.run([...])`. On non-Windows platforms, newly started jobs are
+placed in a new session and the fallback tree cleanup sends `SIGKILL` to that process
+group. This is not an absolute guarantee, especially if grandchildren detach into
+another session or the platform command fails. Cancel does not roll back file
+changes. Callers should inspect `new_changed_files`, `all_changed_files`, and
+`policy_violation` to review any changes that happened before cancellation.
 
 ### `opencode_server_start`
 
@@ -216,6 +227,9 @@ The tool waits until the selected port accepts TCP connections, then returns:
 - `finished_at`
 - `stdout_tail`
 - `stderr_tail`
+- `process_tree_kill_attempted`
+- `process_tree_kill_succeeded`
+- `process_tree_kill_error`
 - `process_running`
 - `command`
 - `success`
@@ -230,8 +244,11 @@ Returns the same server fields for a known `server_id`.
 ### `opencode_server_stop`
 
 Terminates the managed server process and returns the final server status. This is a
-best-effort main-process termination; full process-tree cleanup is a backlog item.
-For requested stops, `status` is the primary result field; the underlying process may
+best-effort stop. The wrapper first asks the main server process to terminate. If it
+does not exit in time, it attempts the same process-tree cleanup strategy used by
+`opencode_coder_cancel`: Windows uses `taskkill /PID <pid> /T /F`; non-Windows
+launches the server in a new session and kills that process group as a fallback. For
+requested stops, `status` is the primary result field; the underlying process may
 return a non-zero `exit_code` even when the stop operation succeeds.
 
 ## Git Snapshots
@@ -341,6 +358,7 @@ diagnosis.
 - Decide whether the real OpenCode integration smoke test should become a scheduled
   or CI-gated check.
 - Persistent server/job registry across MCP server restarts.
-- Process-tree cleanup for server stop.
+- Stronger cross-platform process-tree cleanup verification with real child process
+  trees.
 - More detailed test/validation extraction from OpenCode output.
 - Automatic rollback or cleanup for policy violations.

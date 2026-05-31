@@ -227,6 +227,20 @@ def commit_all(working_dir: str, message: str = "test commit") -> None:
     )
 
 
+TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def wait_for_terminal_job(job_id: str, total_wait_seconds: float = 3.0) -> dict:
+    deadline = time.monotonic() + total_wait_seconds
+    status = server.opencode_coder_status(job_id)
+    while status["status"] not in TERMINAL_JOB_STATUSES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return status
+        status = server.opencode_coder_status(job_id, wait_seconds=min(0.25, remaining))
+    return status
+
+
 class OpenCodeCoderTests(unittest.TestCase):
     def setUp(self):
         FAKE_BUILD_CALLS.clear()
@@ -286,8 +300,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             self.assertEqual(result["wait_policy"], "start_only")
             self.assertIn(result["status"], {"running", "timed_out", "completed"})
             job_id = result["job_id"]
-            time.sleep(0.8)
-            final_status = server.opencode_coder_status(job_id)
+            final_status = wait_for_terminal_job(job_id)
 
         self.assertEqual(final_status["status"], "completed")
         self.assertIn("done", final_status["stdout_tail"])
@@ -302,7 +315,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 wait_policy="first_output",
             )
             elapsed = time.monotonic() - started_at
-            final_status = server.opencode_coder_status(result["job_id"], wait_seconds=2)
+            final_status = wait_for_terminal_job(result["job_id"])
 
         self.assertLess(elapsed, 0.65)
         self.assertEqual(result["wait_policy"], "first_output")
@@ -323,7 +336,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 allowed_paths=["src"],
             )
             elapsed = time.monotonic() - started_at
-            final_status = server.opencode_coder_status(result["job_id"], wait_seconds=2)
+            final_status = wait_for_terminal_job(result["job_id"])
 
         self.assertLess(elapsed, 0.75)
         self.assertEqual(result["wait_policy"], "first_change")
@@ -344,7 +357,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             started_at = time.monotonic()
             status = server.opencode_coder_status(initial["job_id"], wait_seconds=1)
             elapsed = time.monotonic() - started_at
-            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=2)
+            final_status = wait_for_terminal_job(initial["job_id"])
 
         self.assertLess(elapsed, 0.6)
         self.assertEqual(len(FAKE_BUILD_CALLS), build_call_count)
@@ -366,7 +379,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             started_at = time.monotonic()
             second_status = server.opencode_coder_status(initial["job_id"], wait_seconds=1.2)
             elapsed = time.monotonic() - started_at
-            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=3)
+            final_status = wait_for_terminal_job(initial["job_id"])
 
         self.assertLess(elapsed, 1.0)
         self.assertEqual(second_status["new_changed_files"], ["src/a.txt"])
@@ -410,12 +423,34 @@ class OpenCodeCoderTests(unittest.TestCase):
                 wait_seconds=2,
                 stdout_cursor=initial["stdout_cursor"],
             )
-            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=2)
+            final_status = wait_for_terminal_job(initial["job_id"])
 
         self.assertIn("done", status["stdout_delta"])
         self.assertNotIn("first", status["stdout_delta"])
         self.assertGreater(status["stdout_cursor"], initial["stdout_cursor"])
         self.assertFalse(status["stdout_delta_truncated"])
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_status_existing_unread_stdout_delta_returns_without_waiting(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            started_at = time.monotonic()
+            status = server.opencode_coder_status(
+                initial["job_id"],
+                wait_seconds=0.7,
+                stdout_cursor=0,
+            )
+            elapsed = time.monotonic() - started_at
+            final_status = wait_for_terminal_job(initial["job_id"])
+
+        self.assertLess(elapsed, 0.25)
+        self.assertIn("first", status["stdout_delta"])
+        self.assertGreater(status["stdout_cursor"], 0)
         self.assertEqual(final_status["status"], "completed")
 
     def test_status_stderr_delta_from_previous_cursor(self):
@@ -431,7 +466,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 wait_seconds=2,
                 stderr_cursor=initial["stderr_cursor"],
             )
-            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=2)
+            final_status = wait_for_terminal_job(initial["job_id"])
 
         self.assertIn("err-done", status["stderr_delta"])
         self.assertNotIn("err-first", status["stderr_delta"])
@@ -506,7 +541,75 @@ class OpenCodeCoderTests(unittest.TestCase):
 
         self.assertEqual(stopped["status"], "stopped")
         self.assertFalse(stopped["process_running"])
+        self.assertIn("process_tree_kill_attempted", stopped)
+        self.assertIn("process_tree_kill_succeeded", stopped)
+        self.assertIn("process_tree_kill_error", stopped)
+        self.assertFalse(stopped["process_tree_kill_attempted"])
+        self.assertFalse(stopped["process_tree_kill_succeeded"])
+        self.assertIsNone(stopped["process_tree_kill_error"])
         self.assertEqual(status["status"], "stopped")
+
+    def test_process_tree_kill_helper_uses_platform_cleanup_path(self):
+        class DummyProcess:
+            pid = 4321
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = -9
+                return self.returncode
+
+        process = DummyProcess()
+        if os.name == "nt":
+            calls = []
+            original_run = server.subprocess.run
+
+            class DummyCompletedProcess:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def fake_run(args, **kwargs):
+                calls.append((args, kwargs))
+                return DummyCompletedProcess()
+
+            server.subprocess.run = fake_run
+            try:
+                result = server.process_tree_kill(process)
+            finally:
+                server.subprocess.run = original_run
+
+            self.assertEqual(calls[0][0], ["taskkill", "/PID", "4321", "/T", "/F"])
+            self.assertFalse(calls[0][1].get("shell", False))
+        else:
+            calls = []
+            original_killpg = server.os.killpg
+
+            def fake_killpg(pgid, sig):
+                calls.append((pgid, sig))
+
+            server.os.killpg = fake_killpg
+            try:
+                result = server.process_tree_kill(process)
+            finally:
+                server.os.killpg = original_killpg
+
+            self.assertEqual(calls, [(4321, server.signal.SIGKILL)])
+
+        self.assertTrue(result.attempted)
+        self.assertTrue(result.succeeded)
+        self.assertIsNone(result.error)
+
+    def test_popen_platform_kwargs_keep_hidden_window_or_session(self):
+        kwargs = server.popen_platform_kwargs()
+        if os.name == "nt":
+            self.assertEqual(kwargs.get("creationflags"), getattr(server.subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            self.assertTrue(kwargs["start_new_session"])
 
     def test_build_command_supports_attach_session_and_title_flags(self):
         command = self.original_build_command(
@@ -604,8 +707,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             running_status = server.opencode_coder_status(job_id)
             self.assertIn(running_status["status"], {"timed_out", "completed"})
 
-            time.sleep(0.8)
-            final_status = server.opencode_coder_status(job_id)
+            final_status = wait_for_terminal_job(job_id)
 
         self.assertEqual(final_status["status"], "completed")
         self.assertEqual(final_status["exit_code"], 0)
@@ -623,8 +725,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             self.assertFalse(second["new_job_started"])
             self.assertIn(second["status"], {"running", "timed_out"})
 
-            time.sleep(0.8)
-            final_status = server.opencode_coder_status(first["job_id"])
+            final_status = wait_for_terminal_job(first["job_id"])
 
         self.assertEqual(final_status["status"], "completed")
 
@@ -757,8 +858,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 allowed_paths=["src"],
             )
             self.assertEqual(initial["status"], "timed_out")
-            time.sleep(0.6)
-            final_status = server.opencode_coder_status(initial["job_id"])
+            final_status = wait_for_terminal_job(initial["job_id"])
 
         self.assertEqual(final_status["status"], "completed")
         self.assertTrue(final_status["policy_violation"])
@@ -779,6 +879,12 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["cancel_requested"])
         self.assertTrue(result["cancel_signal_sent"] or result["cancel_kill_sent"])
+        self.assertIn("process_tree_kill_attempted", result)
+        self.assertIn("process_tree_kill_succeeded", result)
+        self.assertIn("process_tree_kill_error", result)
+        if not result["process_tree_kill_attempted"]:
+            self.assertFalse(result["process_tree_kill_succeeded"])
+            self.assertIsNone(result["process_tree_kill_error"])
         self.assertFalse(result["process_running"])
         self.assertEqual(status["status"], "cancelled")
         self.assertFalse(status["process_running"])
@@ -808,6 +914,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["cancel_requested"])
         self.assertFalse(result["cancel_signal_sent"])
         self.assertFalse(result["cancel_kill_sent"])
+        self.assertFalse(result["process_tree_kill_attempted"])
+        self.assertFalse(result["process_tree_kill_succeeded"])
+        self.assertIsNone(result["process_tree_kill_error"])
         self.assertEqual(result["exit_code"], 0)
 
     def test_cancel_missing_job_returns_structured_not_found(self):
@@ -819,6 +928,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["cancel_requested"])
         self.assertFalse(result["cancel_signal_sent"])
         self.assertFalse(result["cancel_kill_sent"])
+        self.assertFalse(result["process_tree_kill_attempted"])
+        self.assertFalse(result["process_tree_kill_succeeded"])
+        self.assertIsNone(result["process_tree_kill_error"])
 
     def test_cancel_is_safe_when_called_multiple_times(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -835,6 +947,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(second["status"], "cancelled")
         self.assertFalse(second["process_running"])
         self.assertTrue(second["cancel_requested"])
+        self.assertIn("process_tree_kill_attempted", second)
+        self.assertIn("process_tree_kill_succeeded", second)
+        self.assertIn("process_tree_kill_error", second)
 
     def test_cancelled_job_preserves_snapshot_and_path_policy(self):
         with tempfile.TemporaryDirectory() as working_dir:

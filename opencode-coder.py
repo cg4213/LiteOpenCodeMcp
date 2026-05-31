@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -97,6 +98,9 @@ class OpenCodeJob:
     cancel_requested: bool = False
     cancel_signal_sent: bool = False
     cancel_kill_sent: bool = False
+    process_tree_kill_attempted: bool = False
+    process_tree_kill_succeeded: bool = False
+    process_tree_kill_error: str | None = None
     summary: str = ""
     error: str | None = None
     output_event: threading.Event = field(default_factory=threading.Event)
@@ -123,8 +127,18 @@ class OpenCodeServer:
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
     error: str | None = None
     stop_requested: bool = False
+    process_tree_kill_attempted: bool = False
+    process_tree_kill_succeeded: bool = False
+    process_tree_kill_error: str | None = None
     done_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+@dataclass
+class ProcessTreeKillResult:
+    attempted: bool = False
+    succeeded: bool = False
+    error: str | None = None
 
 
 def resolve_opencode() -> str:
@@ -221,6 +235,72 @@ def compute_effective_timeout(timeout_seconds: float | int | None) -> tuple[floa
     else:
         policy = "requested_timeout_seconds"
     return requested, effective, policy
+
+
+def popen_platform_kwargs() -> dict:
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return {"creationflags": creationflags} if creationflags else {}
+    return {"start_new_session": True}
+
+
+def process_tree_kill(process: subprocess.Popen, timeout_seconds: float = 5.0) -> ProcessTreeKillResult:
+    if process is None or process.pid is None:
+        return ProcessTreeKillResult(error="process_not_available")
+    if process.poll() is not None:
+        return ProcessTreeKillResult()
+
+    result = ProcessTreeKillResult(attempted=True)
+    pid = int(process.pid)
+    try:
+        if os.name == "nt":
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+            )
+            if completed.returncode != 0:
+                output = (completed.stderr or completed.stdout or "").strip()
+                result.error = output or f"taskkill exited with code {completed.returncode}"
+        else:
+            os.killpg(pid, signal.SIGKILL)
+
+        try:
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            result.error = result.error or "process did not exit after process tree kill"
+
+        result.succeeded = process.poll() is not None
+        if result.succeeded and result.error:
+            result.error = None
+        return result
+    except ProcessLookupError:
+        result.succeeded = process.poll() is not None
+        if not result.succeeded:
+            result.error = "process tree was not found"
+        return result
+    except subprocess.TimeoutExpired as exc:
+        result.error = f"process tree kill command timed out: {exc}"
+        result.succeeded = process.poll() is not None
+        return result
+    except Exception as exc:
+        result.error = str(exc)
+        result.succeeded = process.poll() is not None
+        return result
+
+
+def record_process_tree_kill_result(target, result: ProcessTreeKillResult) -> None:
+    with target.lock:
+        if result.attempted:
+            target.process_tree_kill_attempted = True
+        if result.succeeded:
+            target.process_tree_kill_succeeded = True
+        if result.error:
+            target.process_tree_kill_error = result.error
 
 
 def normalize_wait_policy(wait_policy: str | None) -> str:
@@ -375,6 +455,21 @@ def output_delta_locked(target, kind: str, cursor) -> tuple[str, int, bool]:
     delta_start = max(parsed_cursor, buffer_start)
     delta_offset = max(0, delta_start - buffer_start)
     return buffer[delta_offset:], current_cursor, parsed_cursor < buffer_start
+
+
+def has_pending_output_delta(job: OpenCodeJob, stdout_cursor, stderr_cursor) -> bool:
+    with job.lock:
+        stdout_delta, _stdout_current, stdout_truncated = output_delta_locked(
+            job,
+            "stdout",
+            stdout_cursor,
+        )
+        stderr_delta, _stderr_current, stderr_truncated = output_delta_locked(
+            job,
+            "stderr",
+            stderr_cursor,
+        )
+    return bool(stdout_delta or stderr_delta or stdout_truncated or stderr_truncated)
 
 
 def find_session_id(value) -> str | None:
@@ -544,6 +639,9 @@ def server_to_result(server: OpenCodeServer) -> dict:
             "finished_at": server.finished_at,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
+            "process_tree_kill_attempted": server.process_tree_kill_attempted,
+            "process_tree_kill_succeeded": server.process_tree_kill_succeeded,
+            "process_tree_kill_error": server.process_tree_kill_error,
             "process_running": process_running,
             "command": " ".join(server.command),
             "success": server.status in {"running", "stopped"} and server.error is None,
@@ -609,6 +707,9 @@ def make_server_not_found_result(server_id: str) -> dict:
         "finished_at": None,
         "stdout_tail": "",
         "stderr_tail": "",
+        "process_tree_kill_attempted": False,
+        "process_tree_kill_succeeded": False,
+        "process_tree_kill_error": None,
         "process_running": False,
         "command": None,
         "success": False,
@@ -1017,6 +1118,9 @@ def job_to_result(
             "cancel_requested": job.cancel_requested,
             "cancel_signal_sent": job.cancel_signal_sent,
             "cancel_kill_sent": job.cancel_kill_sent,
+            "process_tree_kill_attempted": job.process_tree_kill_attempted,
+            "process_tree_kill_succeeded": job.process_tree_kill_succeeded,
+            "process_tree_kill_error": job.process_tree_kill_error,
             "process_running": process_running,
             "lock_rejected": lock_rejected,
             "new_job_started": new_job_started,
@@ -1075,6 +1179,9 @@ def make_job_not_found_result(job_id: str) -> dict:
         "cancel_requested": False,
         "cancel_signal_sent": False,
         "cancel_kill_sent": False,
+        "process_tree_kill_attempted": False,
+        "process_tree_kill_succeeded": False,
+        "process_tree_kill_error": None,
         "process_running": False,
         "lock_rejected": False,
         "new_job_started": False,
@@ -1286,7 +1393,6 @@ def start_job(
         _CWD_ACTIVE_JOBS.setdefault(cwd_key, set()).add(job.job_id)
 
     try:
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
             command,
             cwd=resolved_working_dir,
@@ -1297,7 +1403,7 @@ def start_job(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            creationflags=creationflags,
+            **popen_platform_kwargs(),
         )
     except Exception as exc:
         finish_job(job, None, str(exc))
@@ -1367,7 +1473,6 @@ def opencode_server_start(
         return server_to_result(server)
 
     try:
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
             command,
             cwd=resolved_working_dir,
@@ -1378,7 +1483,7 @@ def opencode_server_start(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            creationflags=creationflags,
+            **popen_platform_kwargs(),
         )
     except Exception as exc:
         with server.lock:
@@ -1430,8 +1535,8 @@ def opencode_server_start(
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
+            tree_result = process_tree_kill(process)
+            record_process_tree_kill_result(server, tree_result)
 
     return server_to_result(server)
 
@@ -1463,8 +1568,8 @@ def opencode_server_stop(server_id: str) -> dict:
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            tree_result = process_tree_kill(process)
+            record_process_tree_kill_result(server, tree_result)
 
     server.done_event.wait(timeout=2)
     refresh_server_status(server)
@@ -1550,14 +1655,13 @@ def opencode_coder_cancel(job_id: str) -> dict:
     try:
         process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        try:
-            process.kill()
+        with job.lock:
+            job.cancel_kill_sent = True
+        tree_result = process_tree_kill(process)
+        record_process_tree_kill_result(job, tree_result)
+        if tree_result.error:
             with job.lock:
-                job.cancel_kill_sent = True
-            process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            with job.lock:
-                job.summary = f"Cancellation requested, but kill did not finish cleanly: {exc}"
+                job.summary = f"Cancellation requested, but process tree kill did not finish cleanly: {tree_result.error}"
 
     job.done_event.wait(timeout=2)
     return job_to_result(job, new_job_started=False)
@@ -1578,7 +1682,8 @@ def opencode_coder_status(
     if job is None:
         return make_job_not_found_result(job_id)
 
-    wait_for_status_activity(job, wait_seconds)
+    if not has_pending_output_delta(job, stdout_cursor, stderr_cursor):
+        wait_for_status_activity(job, wait_seconds)
     if job.process is not None and job.process.poll() is not None and not job.done_event.is_set():
         job.done_event.wait(timeout=0.2)
     return job_to_result(
@@ -1600,8 +1705,7 @@ def _reset_jobs_for_tests() -> None:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+                process_tree_kill(process, timeout_seconds=2)
 
     with _REGISTRY_LOCK:
         _JOBS.clear()
@@ -1619,8 +1723,7 @@ def _reset_servers_for_tests() -> None:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+                process_tree_kill(process, timeout_seconds=2)
 
     with _SERVER_REGISTRY_LOCK:
         _SERVERS.clear()
