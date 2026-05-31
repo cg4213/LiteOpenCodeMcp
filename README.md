@@ -80,10 +80,16 @@ Parameters:
 - `job_id`: job returned by `opencode_coder`.
 - `wait_seconds`: optional short wait, clamped to `0..30`. Defaults to `0` for an
   immediate status response.
+- `stdout_cursor`: optional stdout cursor returned by a previous job/status result.
+- `stderr_cursor`: optional stderr cursor returned by a previous job/status result.
 
 When `wait_seconds` is greater than zero, status waits until the job completes, new
 stdout/stderr arrives, a new file change is detected, or the wait expires. Status
 queries never start a new OpenCode process.
+
+When a cursor is provided, the response includes `stdout_delta` and/or
+`stderr_delta` with only the text after that cursor. Cursors are character offsets
+inside a bounded in-memory buffer; they are not persistent log file offsets.
 
 Returns a structured result including:
 
@@ -111,6 +117,12 @@ Returns a structured result including:
 - `validation_skipped_reason`
 - `stdout_tail`
 - `stderr_tail`
+- `stdout_delta`
+- `stderr_delta`
+- `stdout_cursor`
+- `stderr_cursor`
+- `stdout_delta_truncated`
+- `stderr_delta_truncated`
 - `started_at`
 - `finished_at`
 - `first_output_at`
@@ -118,9 +130,63 @@ Returns a structured result including:
 - `last_activity_at`
 - `command`
 - `wait_policy`
+- `cancel_requested`
+- `cancel_signal_sent`
+- `cancel_kill_sent`
 
 Finished jobs are retained in memory for at least
 `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS` seconds. The default is `3600`.
+
+Cursor polling example:
+
+```python
+status = opencode_coder_status(job_id)
+stdout_cursor = status["stdout_cursor"]
+stderr_cursor = status["stderr_cursor"]
+
+next_status = opencode_coder_status(
+    job_id,
+    wait_seconds=5,
+    stdout_cursor=stdout_cursor,
+    stderr_cursor=stderr_cursor,
+)
+print(next_status["stdout_delta"])
+print(next_status["stderr_delta"])
+```
+
+Delta buffers are bounded by `MAX_DELTA_BUFFER_CHARS` inside the wrapper. If a cursor
+is older than the retained buffer, the wrapper returns the currently available suffix
+and sets `stdout_delta_truncated` or `stderr_delta_truncated` to `true`. Use
+`stdout_tail` and `stderr_tail` for compatibility, and use cursor/delta polling to
+avoid repeatedly transferring the same tail text.
+
+### `opencode_coder_cancel`
+
+Cancels a running `opencode_coder` job by `job_id` and returns the same structured
+job result shape as `opencode_coder_status`.
+
+Behavior:
+
+- Unknown or expired `job_id` returns `status="not_found"`, `success=false`, and
+  `error="job_not_found"`.
+- Completed, failed, or already cancelled jobs are returned as-is; no new terminate
+  signal is sent.
+- Running jobs are marked with `cancel_requested=true`, then the wrapper sends
+  `process.terminate()` to the OpenCode process and waits briefly. If the process is
+  still alive, it sends `process.kill()`.
+- Cancelled jobs finish with `status="cancelled"` and `success=false`. The
+  `exit_code` field keeps the actual process exit code.
+
+Additional cancel fields:
+
+- `cancel_requested`
+- `cancel_signal_sent`
+- `cancel_kill_sent`
+
+Cancel is best-effort main-process termination. It does not perform full process-tree
+cleanup and does not roll back file changes. Callers should inspect
+`new_changed_files`, `all_changed_files`, and `policy_violation` to review any
+changes that happened before cancellation.
 
 ### `opencode_server_start`
 
@@ -229,6 +295,7 @@ modify files.
 - `timed_out`: MCP wait window elapsed, but the OpenCode process continues.
 - `completed`: process finished with exit code `0`.
 - `failed`: process could not start or finished with a non-zero exit code.
+- `cancelled`: cancellation was requested and the OpenCode process exited.
 - `not_found`: status query used an unknown or expired `job_id`.
 
 ## Compatibility
@@ -241,12 +308,38 @@ The wrapper still returns legacy fields:
 
 New callers should prefer `status`, `exit_code`, `stdout_tail`, and `stderr_tail`.
 Tail fields are bounded by line and character limits to keep MCP responses compact.
+For polling loops, prefer `stdout_cursor` / `stderr_cursor` with delta fields over
+re-reading the full tail each time.
+
+## Integration Smoke Test
+
+The real OpenCode integration smoke test is opt-in and skipped by default. It starts
+a managed `opencode serve` process, runs `opencode_coder` through `--attach`, polls
+`opencode_coder_status`, and verifies git snapshot fields in a temporary git
+repository.
+
+The smoke test may perform a real model call and can depend on network access,
+authentication, configured OpenCode provider state, and any associated usage costs.
+It writes only to a `TemporaryDirectory` created by the test and does not touch user
+projects.
+
+PowerShell:
+
+```powershell
+$env:OPENCODE_CODER_RUN_INTEGRATION = "1"
+python -B -m unittest -v test_opencode_coder.OpenCodeCoderIntegrationTests
+Remove-Item Env:\OPENCODE_CODER_RUN_INTEGRATION
+```
+
+If `opencode` is not on `PATH`, or if `OPENCODE_CODER_RUN_INTEGRATION` is not set to
+`1`, the integration test is skipped. Failures from model, network, or authentication
+problems include the structured job/server status and stdout/stderr tails for
+diagnosis.
 
 ## Backlog
 
-- Explicit `opencode_coder_cancel`.
-- stdout/stderr cursor support for incremental tail reads.
-- Real OpenCode integration smoke tests.
+- Decide whether the real OpenCode integration smoke test should become a scheduled
+  or CI-gated check.
 - Persistent server/job registry across MCP server restarts.
 - Process-tree cleanup for server stop.
 - More detailed test/validation extraction from OpenCode output.

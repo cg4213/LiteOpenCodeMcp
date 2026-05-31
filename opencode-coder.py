@@ -22,10 +22,12 @@ mcp = FastMCP("opencode-coder")
 
 TAIL_LINES = 120
 MAX_TAIL_CHARS = 12_000
+MAX_DELTA_BUFFER_CHARS = 64_000
 DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_MAX_MCP_WAIT_SECONDS = 110.0
 DEFAULT_FINISHED_JOB_TTL_SECONDS = 3600.0
 MAX_STATUS_WAIT_SECONDS = 30.0
+DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 MAX_FINISHED_JOBS = 100
 ACTIVE_STATUSES = {"starting", "running", "timed_out"}
 VALID_WAIT_POLICIES = {"completion", "start_only", "first_output", "first_change"}
@@ -70,6 +72,12 @@ class OpenCodeJob:
     process: subprocess.Popen[str] | None = None
     stdout_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
+    stdout_buffer: str = ""
+    stderr_buffer: str = ""
+    stdout_buffer_start: int = 0
+    stderr_buffer_start: int = 0
+    stdout_cursor: int = 0
+    stderr_cursor: int = 0
     preexisting_changed_files: list[str] = field(default_factory=list)
     preexisting_file_fingerprints: dict[str, str] = field(default_factory=dict)
     all_changed_files: list[str] = field(default_factory=list)
@@ -86,6 +94,9 @@ class OpenCodeJob:
     last_activity_at: str | None = None
     output_version: int = 0
     change_version: int = 0
+    cancel_requested: bool = False
+    cancel_signal_sent: bool = False
+    cancel_kill_sent: bool = False
     summary: str = ""
     error: str | None = None
     output_event: threading.Event = field(default_factory=threading.Event)
@@ -309,6 +320,63 @@ def tail_to_text(lines: deque[str]) -> str:
     return trim_tail("".join(lines))
 
 
+def parse_output_cursor(cursor) -> int | None:
+    if cursor is None:
+        return None
+    try:
+        parsed = int(cursor)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+def append_output_buffer_locked(target, kind: str, text: str) -> None:
+    if not hasattr(target, "stdout_cursor"):
+        return
+
+    if kind == "stdout":
+        buffer_attr = "stdout_buffer"
+        start_attr = "stdout_buffer_start"
+        cursor_attr = "stdout_cursor"
+    else:
+        buffer_attr = "stderr_buffer"
+        start_attr = "stderr_buffer_start"
+        cursor_attr = "stderr_cursor"
+
+    buffer = getattr(target, buffer_attr) + text
+    buffer_start = getattr(target, start_attr)
+    cursor = getattr(target, cursor_attr) + len(text)
+    if len(buffer) > MAX_DELTA_BUFFER_CHARS:
+        dropped_chars = len(buffer) - MAX_DELTA_BUFFER_CHARS
+        buffer = buffer[dropped_chars:]
+        buffer_start += dropped_chars
+
+    setattr(target, buffer_attr, buffer)
+    setattr(target, start_attr, buffer_start)
+    setattr(target, cursor_attr, cursor)
+
+
+def output_delta_locked(target, kind: str, cursor) -> tuple[str, int, bool]:
+    if kind == "stdout":
+        buffer = target.stdout_buffer
+        buffer_start = target.stdout_buffer_start
+        current_cursor = target.stdout_cursor
+    else:
+        buffer = target.stderr_buffer
+        buffer_start = target.stderr_buffer_start
+        current_cursor = target.stderr_cursor
+
+    parsed_cursor = parse_output_cursor(cursor)
+    if parsed_cursor is None:
+        return "", current_cursor, False
+
+    if parsed_cursor > current_cursor:
+        parsed_cursor = current_cursor
+    delta_start = max(parsed_cursor, buffer_start)
+    delta_offset = max(0, delta_start - buffer_start)
+    return buffer[delta_offset:], current_cursor, parsed_cursor < buffer_start
+
+
 def find_session_id(value) -> str | None:
     if isinstance(value, dict):
         session_id = value.get("sessionID")
@@ -342,11 +410,14 @@ def parse_session_id_from_text(text: str) -> str | None:
 
 
 def append_tail(target, kind: str, text: str) -> None:
-    if len(text) > MAX_TAIL_CHARS:
-        text = text[-MAX_TAIL_CHARS:]
+    output_text = text
+    tail_text = text
+    if len(tail_text) > MAX_TAIL_CHARS:
+        tail_text = tail_text[-MAX_TAIL_CHARS:]
     with target.lock:
         if kind == "stdout":
-            target.stdout_tail.append(text)
+            append_output_buffer_locked(target, kind, output_text)
+            target.stdout_tail.append(tail_text)
             if hasattr(target, "session_id"):
                 now = utc_now()
                 if target.first_output_at is None:
@@ -354,11 +425,12 @@ def append_tail(target, kind: str, text: str) -> None:
                 target.last_activity_at = now
                 target.output_version += 1
                 target.output_event.set()
-                session_id = parse_session_id_from_text(text)
+                session_id = parse_session_id_from_text(output_text)
                 if session_id:
                     target.session_id = session_id
         else:
-            target.stderr_tail.append(text)
+            append_output_buffer_locked(target, kind, output_text)
+            target.stderr_tail.append(tail_text)
             if hasattr(target, "session_id"):
                 now = utc_now()
                 if target.first_output_at is None:
@@ -715,16 +787,23 @@ def finish_job(job: OpenCodeJob, exit_code: int | None, error: str | None = None
     final_snapshot = collect_git_status(job.working_dir)
     apply_git_snapshot(job, final_snapshot)
     with job.lock:
+        cancel_requested = job.cancel_requested
         job.exit_code = exit_code
         job.finished_at = utc_now()
-        job.error = error
-        if error is not None:
+        if cancel_requested:
+            job.error = error or "job_cancelled"
+            job.status = "cancelled"
+            job.summary = "OpenCode job was cancelled by request."
+        elif error is not None:
+            job.error = error
             job.status = "failed"
             job.summary = f"OpenCode process failed in wrapper: {error}"
         elif exit_code == 0:
+            job.error = None
             job.status = "completed"
             job.summary = "OpenCode completed successfully."
         else:
+            job.error = None
             job.status = "failed"
             job.summary = f"OpenCode exited with non-zero code {exit_code}."
         job.done_event.set()
@@ -857,6 +936,8 @@ def job_to_result(
     lock_rejected: bool = False,
     new_job_started: bool = True,
     summary_override: str | None = None,
+    stdout_cursor: int | None = None,
+    stderr_cursor: int | None = None,
 ) -> dict:
     if is_job_active(job):
         refresh_job_snapshot(job)
@@ -864,6 +945,16 @@ def job_to_result(
     with job.lock:
         stdout_tail = tail_to_text(job.stdout_tail)
         stderr_tail = tail_to_text(job.stderr_tail)
+        stdout_delta, current_stdout_cursor, stdout_delta_truncated = output_delta_locked(
+            job,
+            "stdout",
+            stdout_cursor,
+        )
+        stderr_delta, current_stderr_cursor, stderr_delta_truncated = output_delta_locked(
+            job,
+            "stderr",
+            stderr_cursor,
+        )
         process_running = job.process is not None and job.process.poll() is None
         output = trim_tail((stdout_tail + "\n" + stderr_tail).strip())
         status = job.status
@@ -879,6 +970,8 @@ def job_to_result(
                 summary = "OpenCode is still running."
             elif status == "failed":
                 summary = "OpenCode failed."
+            elif status == "cancelled":
+                summary = "OpenCode job was cancelled by request."
 
         return {
             "job_id": job.job_id,
@@ -905,6 +998,12 @@ def job_to_result(
             "validation_skipped_reason": "MCP wrapper does not run validation; inspect OpenCode output or task-level tooling.",
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
+            "stdout_delta": stdout_delta,
+            "stderr_delta": stderr_delta,
+            "stdout_cursor": current_stdout_cursor,
+            "stderr_cursor": current_stderr_cursor,
+            "stdout_delta_truncated": stdout_delta_truncated,
+            "stderr_delta_truncated": stderr_delta_truncated,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "first_output_at": job.first_output_at,
@@ -915,6 +1014,9 @@ def job_to_result(
             "requested_timeout_seconds": job.requested_timeout_seconds,
             "effective_timeout_seconds": job.effective_timeout_seconds,
             "timeout_policy": job.timeout_policy,
+            "cancel_requested": job.cancel_requested,
+            "cancel_signal_sent": job.cancel_signal_sent,
+            "cancel_kill_sent": job.cancel_kill_sent,
             "process_running": process_running,
             "lock_rejected": lock_rejected,
             "new_job_started": new_job_started,
@@ -923,6 +1025,64 @@ def job_to_result(
             "return_code": job.exit_code,
             "error": job.error,
         }
+
+
+def make_job_not_found_result(job_id: str) -> dict:
+    return {
+        "job_id": job_id,
+        "status": "not_found",
+        "working_dir": None,
+        "pid": None,
+        "exit_code": None,
+        "summary": (
+            "Job id was not found. It may be invalid, belong to another MCP server process, "
+            "or have expired from the in-memory retention window."
+        ),
+        "session_id": None,
+        "server_id": None,
+        "server_url": None,
+        "attached_to_server": False,
+        "changed_files": [],
+        "preexisting_changed_files": [],
+        "all_changed_files": [],
+        "new_changed_files": [],
+        "policy_violation": False,
+        "extra_changed_files": [],
+        "forbidden_changed_files": [],
+        "path_policy": None,
+        "git_status_available": False,
+        "git_status_error": "job_not_found",
+        "tests_run": [],
+        "validation_skipped_reason": "No job was found to validate.",
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "stdout_delta": "",
+        "stderr_delta": "",
+        "stdout_cursor": 0,
+        "stderr_cursor": 0,
+        "stdout_delta_truncated": False,
+        "stderr_delta_truncated": False,
+        "started_at": None,
+        "finished_at": None,
+        "first_output_at": None,
+        "first_change_at": None,
+        "last_activity_at": None,
+        "command": None,
+        "wait_policy": None,
+        "requested_timeout_seconds": None,
+        "effective_timeout_seconds": None,
+        "timeout_policy": None,
+        "cancel_requested": False,
+        "cancel_signal_sent": False,
+        "cancel_kill_sent": False,
+        "process_running": False,
+        "lock_rejected": False,
+        "new_job_started": False,
+        "success": False,
+        "output": "",
+        "return_code": None,
+        "error": "job_not_found",
+    }
 
 
 def make_start_failed_result(
@@ -1351,64 +1511,82 @@ def opencode_coder(
 
 
 @mcp.tool()
-def opencode_coder_status(job_id: str, wait_seconds: float = 0.0) -> dict:
+def opencode_coder_cancel(job_id: str) -> dict:
+    """取消仍在运行的 opencode_coder job，并返回结构化 job 结果。"""
+    cleanup_jobs()
+    with _REGISTRY_LOCK:
+        job = _JOBS.get(job_id)
+
+    if job is None:
+        return make_job_not_found_result(job_id)
+
+    process = job.process
+    if process is None:
+        if not job.done_event.is_set():
+            refresh_job_snapshot(job)
+        return job_to_result(job, new_job_started=False)
+
+    already_exited = False
+    with job.lock:
+        if job.done_event.is_set():
+            return job_to_result(job, new_job_started=False)
+        already_exited = process.poll() is not None
+        if not already_exited:
+            job.cancel_requested = True
+            job.summary = "Cancellation requested; waiting for OpenCode process to exit."
+
+    if already_exited:
+        job.done_event.wait(timeout=2)
+        return job_to_result(job, new_job_started=False)
+
+    try:
+        process.terminate()
+        with job.lock:
+            job.cancel_signal_sent = True
+    except OSError as exc:
+        with job.lock:
+            job.summary = f"Cancellation requested, but terminate failed: {exc}"
+
+    try:
+        process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            with job.lock:
+                job.cancel_kill_sent = True
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            with job.lock:
+                job.summary = f"Cancellation requested, but kill did not finish cleanly: {exc}"
+
+    job.done_event.wait(timeout=2)
+    return job_to_result(job, new_job_started=False)
+
+
+@mcp.tool()
+def opencode_coder_status(
+    job_id: str,
+    wait_seconds: float = 0.0,
+    stdout_cursor: int | None = None,
+    stderr_cursor: int | None = None,
+) -> dict:
     """通过 job_id 查询 opencode_coder 后台任务状态和输出尾部。"""
     cleanup_jobs()
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)
 
     if job is None:
-        return {
-            "job_id": job_id,
-            "status": "not_found",
-            "working_dir": None,
-            "pid": None,
-            "exit_code": None,
-            "summary": (
-                "Job id was not found. It may be invalid, belong to another MCP server process, "
-                "or have expired from the in-memory retention window."
-            ),
-            "session_id": None,
-            "server_id": None,
-            "server_url": None,
-            "attached_to_server": False,
-            "changed_files": [],
-            "preexisting_changed_files": [],
-            "all_changed_files": [],
-            "new_changed_files": [],
-            "policy_violation": False,
-            "extra_changed_files": [],
-            "forbidden_changed_files": [],
-            "path_policy": None,
-            "git_status_available": False,
-            "git_status_error": "job_not_found",
-            "tests_run": [],
-            "validation_skipped_reason": "No job was found to validate.",
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "started_at": None,
-            "finished_at": None,
-            "first_output_at": None,
-            "first_change_at": None,
-            "last_activity_at": None,
-            "command": None,
-            "wait_policy": None,
-            "requested_timeout_seconds": None,
-            "effective_timeout_seconds": None,
-            "timeout_policy": None,
-            "process_running": False,
-            "lock_rejected": False,
-            "new_job_started": False,
-            "success": False,
-            "output": "",
-            "return_code": None,
-            "error": "job_not_found",
-        }
+        return make_job_not_found_result(job_id)
 
     wait_for_status_activity(job, wait_seconds)
     if job.process is not None and job.process.poll() is not None and not job.done_event.is_set():
         job.done_event.wait(timeout=0.2)
-    return job_to_result(job, new_job_started=False)
+    return job_to_result(
+        job,
+        new_job_started=False,
+        stdout_cursor=stdout_cursor,
+        stderr_cursor=stderr_cursor,
+    )
 
 
 def _reset_jobs_for_tests() -> None:

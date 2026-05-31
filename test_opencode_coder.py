@@ -1,5 +1,7 @@
 import importlib.util
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +55,19 @@ def fake_command(
             "time.sleep(0.5)\n"
             "print('done', flush=True)\n"
         )
+    elif prompt == "delayed_stderr":
+        code = (
+            "import sys\n"
+            "import time\n"
+            "time.sleep(0.2)\n"
+            "sys.stderr.write('err-first\\n')\n"
+            "sys.stderr.flush()\n"
+            "time.sleep(0.5)\n"
+            "sys.stderr.write('err-done\\n')\n"
+            "sys.stderr.flush()\n"
+        )
+    elif prompt == "large_stdout":
+        code = "print('abcdefghijklmnopqrstuvwxyz', flush=True)"
     elif prompt == "session_json":
         code = "print('{\"sessionID\":\"ses_test_123\"}', flush=True)"
     elif prompt == "long":
@@ -60,6 +75,13 @@ def fake_command(
             "import time\n"
             "print('begin', flush=True)\n"
             "time.sleep(0.4)\n"
+            "print('done', flush=True)\n"
+        )
+    elif prompt == "very_long":
+        code = (
+            "import time\n"
+            "print('begin', flush=True)\n"
+            "time.sleep(10)\n"
             "print('done', flush=True)\n"
         )
     elif prompt == "fail":
@@ -89,6 +111,17 @@ def fake_command(
             "path.parent.mkdir(parents=True, exist_ok=True)\n"
             "path.write_text('generated\\n', encoding='utf-8')\n"
             "print(f'wrote {path}', flush=True)\n"
+        )
+    elif prompt.startswith("write_then_sleep:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "import time\n"
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('generated before cancel\\n', encoding='utf-8')\n"
+            "print(f'wrote {path}', flush=True)\n"
+            "time.sleep(10)\n"
         )
     elif prompt.startswith("delayed_write:"):
         path = prompt.split(":", 1)[1]
@@ -352,6 +385,105 @@ class OpenCodeCoderTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.2)
         self.assertEqual(result["status"], "not_found")
+
+    def test_status_returns_output_cursors(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            status = server.opencode_coder_status(completed["job_id"])
+
+        self.assertGreater(status["stdout_cursor"], 0)
+        self.assertEqual(status["stderr_cursor"], 0)
+        self.assertEqual(status["stdout_delta"], "")
+        self.assertEqual(status["stderr_delta"], "")
+        self.assertIn("ok", status["stdout_tail"])
+
+    def test_status_stdout_delta_from_previous_cursor(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(
+                initial["job_id"],
+                wait_seconds=2,
+                stdout_cursor=initial["stdout_cursor"],
+            )
+            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=2)
+
+        self.assertIn("done", status["stdout_delta"])
+        self.assertNotIn("first", status["stdout_delta"])
+        self.assertGreater(status["stdout_cursor"], initial["stdout_cursor"])
+        self.assertFalse(status["stdout_delta_truncated"])
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_status_stderr_delta_from_previous_cursor(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_stderr",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(
+                initial["job_id"],
+                wait_seconds=2,
+                stderr_cursor=initial["stderr_cursor"],
+            )
+            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=2)
+
+        self.assertIn("err-done", status["stderr_delta"])
+        self.assertNotIn("err-first", status["stderr_delta"])
+        self.assertGreater(status["stderr_cursor"], initial["stderr_cursor"])
+        self.assertFalse(status["stderr_delta_truncated"])
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_status_without_cursor_keeps_legacy_tail_fields(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            status = server.opencode_coder_status(completed["job_id"])
+
+        self.assertIn("ok", status["stdout_tail"])
+        self.assertEqual(status["stdout_delta"], "")
+        self.assertEqual(status["stderr_delta"], "")
+        self.assertIn("ok", status["output"])
+
+    def test_status_invalid_or_out_of_range_cursor_is_safe(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            invalid = server.opencode_coder_status(completed["job_id"], stdout_cursor="bad", stderr_cursor=-5)
+            too_large = server.opencode_coder_status(completed["job_id"], stdout_cursor=999999)
+
+        self.assertIn("ok", invalid["stdout_delta"])
+        self.assertEqual(invalid["stderr_delta"], "")
+        self.assertEqual(too_large["stdout_delta"], "")
+        self.assertEqual(too_large["stdout_cursor"], completed["stdout_cursor"])
+
+    def test_status_old_cursor_reports_delta_truncation(self):
+        previous_limit = server.MAX_DELTA_BUFFER_CHARS
+        server.MAX_DELTA_BUFFER_CHARS = 8
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                completed = server.opencode_coder("large_stdout", working_dir=working_dir, timeout_seconds=2)
+                status = server.opencode_coder_status(completed["job_id"], stdout_cursor=0)
+        finally:
+            server.MAX_DELTA_BUFFER_CHARS = previous_limit
+
+        self.assertTrue(status["stdout_delta_truncated"])
+        self.assertEqual(status["stdout_delta"], "tuvwxyz\n")
+        self.assertEqual(status["stdout_cursor"], completed["stdout_cursor"])
+
+    def test_not_found_status_returns_cursor_and_delta_fields(self):
+        result = server.opencode_coder_status("missing-job", stdout_cursor=123, stderr_cursor=456)
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["stdout_cursor"], 0)
+        self.assertEqual(result["stderr_cursor"], 0)
+        self.assertEqual(result["stdout_delta"], "")
+        self.assertEqual(result["stderr_delta"], "")
+        self.assertFalse(result["stdout_delta_truncated"])
+        self.assertFalse(result["stderr_delta_truncated"])
 
     def test_server_start_registers_running_server_and_status(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -631,6 +763,202 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(final_status["status"], "completed")
         self.assertTrue(final_status["policy_violation"])
         self.assertEqual(final_status["extra_changed_files"], ["docs/outside.txt"])
+
+    def test_cancel_running_job_returns_cancelled_and_not_running(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "very_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            result = server.opencode_coder_cancel(initial["job_id"])
+            status = server.opencode_coder_status(initial["job_id"])
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertFalse(result["success"])
+        self.assertTrue(result["cancel_requested"])
+        self.assertTrue(result["cancel_signal_sent"] or result["cancel_kill_sent"])
+        self.assertFalse(result["process_running"])
+        self.assertEqual(status["status"], "cancelled")
+        self.assertFalse(status["process_running"])
+
+    def test_cancel_releases_cwd_lock_for_next_job(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "very_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            cancelled = server.opencode_coder_cancel(initial["job_id"])
+            next_result = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertFalse(cancelled["process_running"])
+        self.assertEqual(next_result["status"], "completed")
+        self.assertFalse(next_result["lock_rejected"])
+
+    def test_cancel_completed_job_is_idempotent_no_signal(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            result = server.opencode_coder_cancel(completed["job_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["cancel_requested"])
+        self.assertFalse(result["cancel_signal_sent"])
+        self.assertFalse(result["cancel_kill_sent"])
+        self.assertEqual(result["exit_code"], 0)
+
+    def test_cancel_missing_job_returns_structured_not_found(self):
+        result = server.opencode_coder_cancel("missing-job")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "job_not_found")
+        self.assertFalse(result["cancel_requested"])
+        self.assertFalse(result["cancel_signal_sent"])
+        self.assertFalse(result["cancel_kill_sent"])
+
+    def test_cancel_is_safe_when_called_multiple_times(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "very_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            first = server.opencode_coder_cancel(initial["job_id"])
+            second = server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertEqual(first["status"], "cancelled")
+        self.assertEqual(second["status"], "cancelled")
+        self.assertFalse(second["process_running"])
+        self.assertTrue(second["cancel_requested"])
+
+    def test_cancelled_job_preserves_snapshot_and_path_policy(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "write_then_sleep:src/cancelled.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                allowed_paths=["src"],
+            )
+            result = server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["new_changed_files"], ["src/cancelled.txt"])
+        self.assertEqual(result["all_changed_files"], ["src/cancelled.txt"])
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["extra_changed_files"], [])
+        self.assertEqual(result["forbidden_changed_files"], [])
+
+
+class OpenCodeCoderIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        if os.environ.get("OPENCODE_CODER_RUN_INTEGRATION") != "1":
+            self.skipTest("set OPENCODE_CODER_RUN_INTEGRATION=1 to run real opencode integration tests")
+        if shutil.which("opencode") is None:
+            self.skipTest("opencode CLI was not found on PATH")
+        server._reset_jobs_for_tests()
+        server._reset_servers_for_tests()
+        self.server_id = None
+
+    def tearDown(self):
+        if self.server_id is not None:
+            try:
+                server.opencode_server_stop(self.server_id)
+            finally:
+                self.server_id = None
+        server._reset_jobs_for_tests()
+        server._reset_servers_for_tests()
+
+    def integration_total_wait_seconds(self) -> float:
+        try:
+            return float(os.environ.get("OPENCODE_CODER_INTEGRATION_TOTAL_WAIT_SECONDS", "180"))
+        except ValueError:
+            return 180.0
+
+    def wait_for_terminal_job(self, job_id: str) -> dict:
+        deadline = time.monotonic() + self.integration_total_wait_seconds()
+        last_status = server.opencode_coder_status(job_id)
+        while last_status["status"] not in {"completed", "failed"}:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return last_status
+            last_status = server.opencode_coder_status(job_id, wait_seconds=min(10, remaining))
+        return last_status
+
+    def diagnostic(self, *results: dict) -> str:
+        parts = []
+        for result in results:
+            parts.append(
+                "\n".join(
+                    [
+                        f"status={result.get('status')}",
+                        f"success={result.get('success')}",
+                        f"exit_code={result.get('exit_code')}",
+                        f"error={result.get('error')}",
+                        f"summary={result.get('summary')}",
+                        f"stdout_tail={result.get('stdout_tail')}",
+                        f"stderr_tail={result.get('stderr_tail')}",
+                    ]
+                )
+            )
+        return "\n---\n".join(parts)
+
+    def test_managed_server_attach_wait_policy_status_git_snapshot(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            self.server_id = started.get("server_id")
+            self.assertEqual(started["status"], "running", self.diagnostic(started))
+            self.assertTrue(started["success"], self.diagnostic(started))
+            self.assertTrue(started["process_running"], self.diagnostic(started))
+
+            running_status = server.opencode_server_status(self.server_id)
+            self.assertEqual(running_status["status"], "running", self.diagnostic(running_status))
+
+            prompt = (
+                "This is an isolated temporary git repo for a smoke test. "
+                "Create or overwrite exactly one file named smoke_result.txt in the current directory. "
+                "Write exactly this text into the file: LiteOpenCodeMcp integration smoke\n"
+                "Do not create, edit, delete, or rename any other files. Finish after writing the file."
+            )
+            initial = server.opencode_coder(
+                prompt,
+                working_dir=working_dir,
+                timeout_seconds=30,
+                wait_policy="first_output",
+                server_id=self.server_id,
+                title="LiteOpenCodeMcp integration smoke",
+                allowed_paths=["smoke_result.txt"],
+            )
+            self.assertTrue(initial["attached_to_server"], self.diagnostic(initial))
+            self.assertEqual(initial["server_id"], self.server_id, self.diagnostic(initial))
+            self.assertEqual(initial["server_url"], started["url"], self.diagnostic(initial))
+
+            final_status = self.wait_for_terminal_job(initial["job_id"])
+            if not final_status.get("session_id"):
+                print("integration note: session_id was not observed in stdout JSON events")
+
+            result_path = Path(working_dir, "smoke_result.txt")
+            self.assertEqual(final_status["status"], "completed", self.diagnostic(initial, final_status))
+            self.assertEqual(final_status["exit_code"], 0, self.diagnostic(initial, final_status))
+            self.assertTrue(result_path.exists(), self.diagnostic(initial, final_status))
+            self.assertIn(
+                "smoke_result.txt",
+                set(final_status["new_changed_files"]) | set(final_status["all_changed_files"]),
+                self.diagnostic(initial, final_status),
+            )
+
+            stopped = server.opencode_server_stop(self.server_id)
+            self.server_id = None
+            self.assertFalse(stopped["process_running"], self.diagnostic(stopped))
+            self.assertEqual(stopped["status"], "stopped", self.diagnostic(stopped))
 
 
 if __name__ == "__main__":
