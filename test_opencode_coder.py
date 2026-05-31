@@ -39,6 +39,20 @@ def fake_command(
     )
     if prompt == "short":
         code = "print('ok', flush=True)"
+    elif prompt == "slow_no_output":
+        code = (
+            "import time\n"
+            "time.sleep(0.4)\n"
+            "print('done', flush=True)\n"
+        )
+    elif prompt == "delayed_output":
+        code = (
+            "import time\n"
+            "time.sleep(0.2)\n"
+            "print('first', flush=True)\n"
+            "time.sleep(0.5)\n"
+            "print('done', flush=True)\n"
+        )
     elif prompt == "session_json":
         code = "print('{\"sessionID\":\"ses_test_123\"}', flush=True)"
     elif prompt == "long":
@@ -75,6 +89,32 @@ def fake_command(
             "path.parent.mkdir(parents=True, exist_ok=True)\n"
             "path.write_text('generated\\n', encoding='utf-8')\n"
             "print(f'wrote {path}', flush=True)\n"
+        )
+    elif prompt.startswith("delayed_write:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "import time\n"
+            "from pathlib import Path\n"
+            "time.sleep(0.2)\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('generated\\n', encoding='utf-8')\n"
+            "time.sleep(0.5)\n"
+            "print(f'done {path}', flush=True)\n"
+        )
+    elif prompt.startswith("double_write_same_file:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "import time\n"
+            "from pathlib import Path\n"
+            "time.sleep(0.15)\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('first\\n', encoding='utf-8')\n"
+            "time.sleep(0.45)\n"
+            "path.write_text('second\\n', encoding='utf-8')\n"
+            "time.sleep(1.5)\n"
+            "print(f'done {path}', flush=True)\n"
         )
     else:
         raise AssertionError(f"unexpected prompt in fake command: {prompt}")
@@ -187,6 +227,132 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIsNone(result["server_url"])
         self.assertIsNone(FAKE_BUILD_CALLS[-1]["server_url"])
 
+    def test_default_completion_wait_policy_keeps_old_behavior(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started_at = time.monotonic()
+            result = server.opencode_coder("delayed_output", working_dir=working_dir, timeout_seconds=2)
+            elapsed = time.monotonic() - started_at
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["wait_policy"], "completion")
+        self.assertGreaterEqual(elapsed, 0.6)
+        self.assertIn("done", result["stdout_tail"])
+
+    def test_start_only_returns_before_background_completion(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started_at = time.monotonic()
+            result = server.opencode_coder(
+                "slow_no_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            elapsed = time.monotonic() - started_at
+
+            self.assertLess(elapsed, 0.35)
+            self.assertEqual(result["wait_policy"], "start_only")
+            self.assertIn(result["status"], {"running", "timed_out", "completed"})
+            job_id = result["job_id"]
+            time.sleep(0.8)
+            final_status = server.opencode_coder_status(job_id)
+
+        self.assertEqual(final_status["status"], "completed")
+        self.assertIn("done", final_status["stdout_tail"])
+
+    def test_first_output_returns_after_initial_output(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started_at = time.monotonic()
+            result = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            elapsed = time.monotonic() - started_at
+            final_status = server.opencode_coder_status(result["job_id"], wait_seconds=2)
+
+        self.assertLess(elapsed, 0.65)
+        self.assertEqual(result["wait_policy"], "first_output")
+        self.assertIsNotNone(result["first_output_at"])
+        self.assertIsNotNone(result["last_activity_at"])
+        self.assertIn("first", result["stdout_tail"])
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_first_change_returns_after_new_changed_file(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            started_at = time.monotonic()
+            result = server.opencode_coder(
+                "delayed_write:src/new.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                allowed_paths=["src"],
+            )
+            elapsed = time.monotonic() - started_at
+            final_status = server.opencode_coder_status(result["job_id"], wait_seconds=2)
+
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(result["wait_policy"], "first_change")
+        self.assertEqual(result["new_changed_files"], ["src/new.txt"])
+        self.assertIsNotNone(result["first_change_at"])
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_status_wait_seconds_waits_for_activity_without_new_job(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            build_call_count = len(FAKE_BUILD_CALLS)
+            started_at = time.monotonic()
+            status = server.opencode_coder_status(initial["job_id"], wait_seconds=1)
+            elapsed = time.monotonic() - started_at
+            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=2)
+
+        self.assertLess(elapsed, 0.6)
+        self.assertEqual(len(FAKE_BUILD_CALLS), build_call_count)
+        self.assertIn(status["status"], {"running", "timed_out", "completed"})
+        self.assertIn("first", status["stdout_tail"])
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_status_wait_seconds_wakes_on_same_file_second_write(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "double_write_same_file:src/a.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+            )
+            first_activity_at = initial["last_activity_at"]
+
+            started_at = time.monotonic()
+            second_status = server.opencode_coder_status(initial["job_id"], wait_seconds=1.2)
+            elapsed = time.monotonic() - started_at
+            final_status = server.opencode_coder_status(initial["job_id"], wait_seconds=3)
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(second_status["new_changed_files"], ["src/a.txt"])
+        self.assertNotEqual(second_status["last_activity_at"], first_activity_at)
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_status_wait_seconds_clamp_helper(self):
+        self.assertEqual(server.clamp_wait_seconds(-1), 0.0)
+        self.assertEqual(server.clamp_wait_seconds(31), 30.0)
+        self.assertEqual(server.clamp_wait_seconds("not-a-number"), 0.0)
+
+    def test_not_found_status_with_wait_seconds_returns_quickly(self):
+        started_at = time.monotonic()
+        result = server.opencode_coder_status("missing-job", wait_seconds=30)
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(result["status"], "not_found")
+
     def test_server_start_registers_running_server_and_status(self):
         with tempfile.TemporaryDirectory() as working_dir:
             result = server.opencode_server_start(working_dir=working_dir, port=0)
@@ -268,10 +434,12 @@ class OpenCodeCoderTests(unittest.TestCase):
                 continue_last=True,
                 fork_session=True,
                 title="Reuse Session",
+                wait_policy="first_output",
             )
             server.opencode_server_stop(started["server_id"])
 
         self.assertEqual(result["session_id"], "ses_test_123")
+        self.assertEqual(result["wait_policy"], "first_output")
         self.assertEqual(FAKE_BUILD_CALLS[-1]["session_id"], "ses_existing")
         self.assertTrue(FAKE_BUILD_CALLS[-1]["continue_last"])
         self.assertTrue(FAKE_BUILD_CALLS[-1]["fork_session"])

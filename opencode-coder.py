@@ -20,13 +20,15 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("opencode-coder")
 
-TAIL_LINES = 200
-MAX_TAIL_CHARS = 24_000
+TAIL_LINES = 120
+MAX_TAIL_CHARS = 12_000
 DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_MAX_MCP_WAIT_SECONDS = 110.0
 DEFAULT_FINISHED_JOB_TTL_SECONDS = 3600.0
+MAX_STATUS_WAIT_SECONDS = 30.0
 MAX_FINISHED_JOBS = 100
 ACTIVE_STATUSES = {"starting", "running", "timed_out"}
+VALID_WAIT_POLICIES = {"completion", "start_only", "first_output", "first_change"}
 
 _JOBS: dict[str, "OpenCodeJob"] = {}
 _CWD_ACTIVE_JOBS: dict[str, set[str]] = {}
@@ -53,6 +55,7 @@ class OpenCodeJob:
     requested_timeout_seconds: float
     effective_timeout_seconds: float
     timeout_policy: str
+    wait_policy: str = "completion"
     allowed_paths: list[str] | None = None
     forbidden_paths: list[str] | None = None
     server_id: str | None = None
@@ -71,14 +74,22 @@ class OpenCodeJob:
     preexisting_file_fingerprints: dict[str, str] = field(default_factory=dict)
     all_changed_files: list[str] = field(default_factory=list)
     new_changed_files: list[str] = field(default_factory=list)
+    observed_change_fingerprints: dict[str, str | None] = field(default_factory=dict)
     changed_files: list[str] = field(default_factory=list)
     policy_violation: bool = False
     extra_changed_files: list[str] = field(default_factory=list)
     forbidden_changed_files: list[str] = field(default_factory=list)
     git_status_available: bool = False
     git_status_error: str | None = None
+    first_output_at: str | None = None
+    first_change_at: str | None = None
+    last_activity_at: str | None = None
+    output_version: int = 0
+    change_version: int = 0
     summary: str = ""
     error: str | None = None
+    output_event: threading.Event = field(default_factory=threading.Event)
+    change_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -171,7 +182,7 @@ def build_opencode_server_command(hostname: str, port: int) -> list[str]:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def env_float(name: str, default_value: float) -> float:
@@ -199,6 +210,22 @@ def compute_effective_timeout(timeout_seconds: float | int | None) -> tuple[floa
     else:
         policy = "requested_timeout_seconds"
     return requested, effective, policy
+
+
+def normalize_wait_policy(wait_policy: str | None) -> str:
+    if wait_policy in VALID_WAIT_POLICIES:
+        return wait_policy
+    return "completion"
+
+
+def clamp_wait_seconds(wait_seconds: float | int | None) -> float:
+    if wait_seconds is None:
+        return 0.0
+    try:
+        parsed = float(wait_seconds)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(parsed, 0.0), MAX_STATUS_WAIT_SECONDS)
 
 
 def normalize_working_dir(working_dir: str) -> tuple[str, str]:
@@ -321,11 +348,24 @@ def append_tail(target, kind: str, text: str) -> None:
         if kind == "stdout":
             target.stdout_tail.append(text)
             if hasattr(target, "session_id"):
+                now = utc_now()
+                if target.first_output_at is None:
+                    target.first_output_at = now
+                target.last_activity_at = now
+                target.output_version += 1
+                target.output_event.set()
                 session_id = parse_session_id_from_text(text)
                 if session_id:
                     target.session_id = session_id
         else:
             target.stderr_tail.append(text)
+            if hasattr(target, "session_id"):
+                now = utc_now()
+                if target.first_output_at is None:
+                    target.first_output_at = now
+                target.last_activity_at = now
+                target.output_version += 1
+                target.output_event.set()
 
 
 def read_stream(target, stream, kind: str) -> None:
@@ -637,6 +677,11 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
             current_files_by_key.get(key) or preexisting_files_by_key.get(key) or key
             for key in changed_during_job_keys
         ])
+        current_change_fingerprints = {
+            key: snapshot.fingerprints.get(key)
+            for key in changed_during_job_keys
+        }
+        previous_change_fingerprints = dict(job.observed_change_fingerprints)
         policy_violation, extra_changed_files, forbidden_changed_files = evaluate_path_policy(
             job.working_dir,
             new_changed_files,
@@ -646,7 +691,15 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
 
         job.all_changed_files = all_changed_files
         job.new_changed_files = new_changed_files
+        job.observed_change_fingerprints = current_change_fingerprints
         job.changed_files = all_changed_files
+        if new_changed_files and current_change_fingerprints != previous_change_fingerprints:
+            now = utc_now()
+            if job.first_change_at is None:
+                job.first_change_at = now
+            job.last_activity_at = now
+            job.change_version += 1
+            job.change_event.set()
         job.policy_violation = policy_violation
         job.extra_changed_files = extra_changed_files
         job.forbidden_changed_files = forbidden_changed_files
@@ -694,6 +747,71 @@ def monitor_job(job: OpenCodeJob, reader_threads: list[threading.Thread]) -> Non
         thread.join(timeout=2)
 
     finish_job(job, exit_code, error)
+
+
+def mark_job_timed_out_if_active(job: OpenCodeJob) -> None:
+    with job.lock:
+        if job.status in {"starting", "running"}:
+            job.status = "timed_out"
+            job.summary = (
+                "OpenCode is still running after the MCP wait window. "
+                "Call opencode_coder_status with job_id for the final result."
+            )
+
+
+def wait_for_job_policy(job: OpenCodeJob, wait_policy: str, wait_seconds: float) -> None:
+    if wait_policy == "start_only":
+        return
+    if wait_seconds <= 0:
+        if not job.done_event.is_set():
+            mark_job_timed_out_if_active(job)
+        return
+
+    if wait_policy == "completion":
+        if not job.done_event.wait(wait_seconds):
+            mark_job_timed_out_if_active(job)
+        return
+
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        if job.done_event.is_set():
+            return
+        if wait_policy == "first_output" and job.output_event.is_set():
+            return
+        if wait_policy == "first_change":
+            refresh_job_snapshot(job)
+            if job.change_event.is_set():
+                return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            mark_job_timed_out_if_active(job)
+            return
+        time.sleep(min(0.1, remaining))
+
+
+def wait_for_status_activity(job: OpenCodeJob, wait_seconds: float) -> None:
+    wait_seconds = clamp_wait_seconds(wait_seconds)
+    if wait_seconds <= 0 or job.done_event.is_set():
+        return
+
+    with job.lock:
+        output_version = job.output_version
+        change_version = job.change_version
+
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        if job.done_event.is_set():
+            return
+        refresh_job_snapshot(job)
+        with job.lock:
+            if job.output_version != output_version or job.change_version != change_version:
+                return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
 
 
 def cleanup_jobs() -> None:
@@ -789,7 +907,11 @@ def job_to_result(
             "stderr_tail": stderr_tail,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            "first_output_at": job.first_output_at,
+            "first_change_at": job.first_change_at,
+            "last_activity_at": job.last_activity_at,
             "command": job.command_summary,
+            "wait_policy": job.wait_policy,
             "requested_timeout_seconds": job.requested_timeout_seconds,
             "effective_timeout_seconds": job.effective_timeout_seconds,
             "timeout_policy": job.timeout_policy,
@@ -812,6 +934,7 @@ def make_start_failed_result(
     requested_timeout_seconds: float,
     effective_timeout_seconds: float,
     timeout_policy: str,
+    wait_policy: str,
     allowed_paths: list[str] | None,
     forbidden_paths: list[str] | None,
     server_id: str | None,
@@ -829,6 +952,7 @@ def make_start_failed_result(
         requested_timeout_seconds=requested_timeout_seconds,
         effective_timeout_seconds=effective_timeout_seconds,
         timeout_policy=timeout_policy,
+        wait_policy=wait_policy,
         allowed_paths=allowed_paths,
         forbidden_paths=forbidden_paths,
         server_id=server_id,
@@ -854,6 +978,7 @@ def start_job(
     allow_concurrent: bool,
     allowed_paths: list[str] | None,
     forbidden_paths: list[str] | None,
+    wait_policy: str | None,
     server_id: str | None,
     session_id: str | None,
     continue_last: bool,
@@ -862,6 +987,7 @@ def start_job(
 ) -> tuple[OpenCodeJob | None, dict | None]:
     cleanup_jobs()
     requested_timeout, effective_timeout, timeout_policy = compute_effective_timeout(timeout_seconds)
+    normalized_wait_policy = normalize_wait_policy(wait_policy)
     resolved_working_dir, cwd_key = normalize_working_dir(working_dir)
     server_url: str | None = None
     attached_to_server = False
@@ -885,6 +1011,7 @@ def start_job(
                 requested_timeout_seconds=requested_timeout,
                 effective_timeout_seconds=effective_timeout,
                 timeout_policy=timeout_policy,
+                wait_policy=normalized_wait_policy,
                 allowed_paths=allowed_paths,
                 forbidden_paths=forbidden_paths,
                 server_id=server_id,
@@ -916,6 +1043,7 @@ def start_job(
                 requested_timeout_seconds=requested_timeout,
                 effective_timeout_seconds=effective_timeout,
                 timeout_policy=timeout_policy,
+                wait_policy=normalized_wait_policy,
                 allowed_paths=allowed_paths,
                 forbidden_paths=forbidden_paths,
                 server_id=server_id,
@@ -948,6 +1076,7 @@ def start_job(
             requested_timeout_seconds=requested_timeout,
             effective_timeout_seconds=effective_timeout,
             timeout_policy=timeout_policy,
+            wait_policy=normalized_wait_policy,
             allowed_paths=allowed_paths,
             forbidden_paths=forbidden_paths,
             server_id=server_id,
@@ -982,6 +1111,7 @@ def start_job(
             requested_timeout_seconds=requested_timeout,
             effective_timeout_seconds=effective_timeout,
             timeout_policy=timeout_policy,
+            wait_policy=normalized_wait_policy,
             allowed_paths=allowed_paths,
             forbidden_paths=forbidden_paths,
             server_id=server_id,
@@ -1189,6 +1319,7 @@ def opencode_coder(
     allow_concurrent: bool = False,
     allowed_paths: list[str] | None = None,
     forbidden_paths: list[str] | None = None,
+    wait_policy: str = "completion",
     server_id: str | None = None,
     session_id: str | None = None,
     continue_last: bool = False,
@@ -1203,6 +1334,7 @@ def opencode_coder(
         allow_concurrent,
         allowed_paths,
         forbidden_paths,
+        wait_policy,
         server_id,
         session_id,
         continue_last,
@@ -1214,21 +1346,12 @@ def opencode_coder(
     if job is None:
         raise RuntimeError("opencode_coder internal error: no job and no result")
 
-    if not job.done_event.wait(job.effective_timeout_seconds):
-        with job.lock:
-            if job.status in {"starting", "running"}:
-                job.status = "timed_out"
-                job.summary = (
-                    "OpenCode is still running after the MCP wait window. "
-                    "Call opencode_coder_status with job_id for the final result."
-                )
-        return job_to_result(job)
-
+    wait_for_job_policy(job, job.wait_policy, job.effective_timeout_seconds)
     return job_to_result(job)
 
 
 @mcp.tool()
-def opencode_coder_status(job_id: str) -> dict:
+def opencode_coder_status(job_id: str, wait_seconds: float = 0.0) -> dict:
     """通过 job_id 查询 opencode_coder 后台任务状态和输出尾部。"""
     cleanup_jobs()
     with _REGISTRY_LOCK:
@@ -1265,7 +1388,11 @@ def opencode_coder_status(job_id: str) -> dict:
             "stderr_tail": "",
             "started_at": None,
             "finished_at": None,
+            "first_output_at": None,
+            "first_change_at": None,
+            "last_activity_at": None,
             "command": None,
+            "wait_policy": None,
             "requested_timeout_seconds": None,
             "effective_timeout_seconds": None,
             "timeout_policy": None,
@@ -1278,6 +1405,7 @@ def opencode_coder_status(job_id: str) -> dict:
             "error": "job_not_found",
         }
 
+    wait_for_status_activity(job, wait_seconds)
     if job.process is not None and job.process.poll() is not None and not job.done_event.is_set():
         job.done_event.wait(timeout=0.2)
     return job_to_result(job, new_job_started=False)

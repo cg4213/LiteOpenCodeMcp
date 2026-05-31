@@ -16,6 +16,8 @@ Parameters:
 - `timeout_seconds`: maximum MCP wait window. If the process is still running after
   this window, the tool returns a structured `timed_out` result with `job_id` and the
   process keeps running in the background.
+- `wait_policy`: controls what the MCP call waits for. Defaults to `"completion"` for
+  compatibility with older callers.
 - `allow_concurrent`: defaults to `false`. When false, a second job for the same
   normalized `working_dir` is rejected and returns the existing running `job_id`.
 - `allowed_paths`: optional list of files or directories that this job may newly
@@ -32,6 +34,20 @@ Parameters:
 client timing out before the wrapper can return job context. The default cap is
 `110` seconds. Returned results include both `requested_timeout_seconds` and
 `effective_timeout_seconds`.
+
+Wait policies:
+
+- `"completion"`: wait for process completion, or until `timeout_seconds` elapses.
+  This is the default and keeps the old behavior.
+- `"start_only"`: return after the process is started and the job is registered.
+  Use this when the caller wants a `job_id` as quickly as possible.
+- `"first_output"`: return after stdout/stderr receives any output, the process
+  completes, or `timeout_seconds` elapses.
+- `"first_change"`: return after `new_changed_files` becomes non-empty, the process
+  completes, or `timeout_seconds` elapses.
+
+For long-running coding tasks, prefer `"start_only"` or `"first_output"` so the
+caller can regain control quickly and poll with `opencode_coder_status`.
 
 When `server_id` is omitted, `opencode_coder` keeps the original direct
 `opencode run` behavior. When `server_id` is provided, it runs through an attached
@@ -50,10 +66,24 @@ Job results also include:
 - `server_id`
 - `server_url`
 - `attached_to_server`
+- `wait_policy`
+- `first_output_at`
+- `first_change_at`
+- `last_activity_at`
 
 ### `opencode_coder_status`
 
 Queries an in-memory job by `job_id`.
+
+Parameters:
+
+- `job_id`: job returned by `opencode_coder`.
+- `wait_seconds`: optional short wait, clamped to `0..30`. Defaults to `0` for an
+  immediate status response.
+
+When `wait_seconds` is greater than zero, status waits until the job completes, new
+stdout/stderr arrives, a new file change is detected, or the wait expires. Status
+queries never start a new OpenCode process.
 
 Returns a structured result including:
 
@@ -83,7 +113,11 @@ Returns a structured result including:
 - `stderr_tail`
 - `started_at`
 - `finished_at`
+- `first_output_at`
+- `first_change_at`
+- `last_activity_at`
 - `command`
+- `wait_policy`
 
 Finished jobs are retained in memory for at least
 `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS` seconds. The default is `3600`.
@@ -206,11 +240,12 @@ The wrapper still returns legacy fields:
 - `return_code`
 
 New callers should prefer `status`, `exit_code`, `stdout_tail`, and `stderr_tail`.
+Tail fields are bounded by line and character limits to keep MCP responses compact.
 
 ## Backlog
 
 - Explicit `opencode_coder_cancel`.
-- More advanced wait policy for attach/server mode.
+- stdout/stderr cursor support for incremental tail reads.
 - Real OpenCode integration smoke tests.
 - Persistent server/job registry across MCP server restarts.
 - Process-tree cleanup for server stop.
