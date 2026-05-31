@@ -5,11 +5,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import threading
+import time
 import uuid
 
 from mcp.server.fastmcp import FastMCP
@@ -28,6 +31,16 @@ ACTIVE_STATUSES = {"starting", "running", "timed_out"}
 _JOBS: dict[str, "OpenCodeJob"] = {}
 _CWD_ACTIVE_JOBS: dict[str, set[str]] = {}
 _REGISTRY_LOCK = threading.RLock()
+_SERVERS: dict[str, "OpenCodeServer"] = {}
+_SERVER_REGISTRY_LOCK = threading.RLock()
+
+
+@dataclass
+class GitStatusSnapshot:
+    available: bool
+    files: list[str] = field(default_factory=list)
+    fingerprints: dict[str, str] = field(default_factory=dict)
+    error: str | None = None
 
 
 @dataclass
@@ -40,6 +53,12 @@ class OpenCodeJob:
     requested_timeout_seconds: float
     effective_timeout_seconds: float
     timeout_policy: str
+    allowed_paths: list[str] | None = None
+    forbidden_paths: list[str] | None = None
+    server_id: str | None = None
+    server_url: str | None = None
+    session_id: str | None = None
+    attached_to_server: bool = False
     status: str = "starting"
     pid: int | None = None
     exit_code: int | None = None
@@ -48,9 +67,40 @@ class OpenCodeJob:
     process: subprocess.Popen[str] | None = None
     stdout_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
+    preexisting_changed_files: list[str] = field(default_factory=list)
+    preexisting_file_fingerprints: dict[str, str] = field(default_factory=dict)
+    all_changed_files: list[str] = field(default_factory=list)
+    new_changed_files: list[str] = field(default_factory=list)
     changed_files: list[str] = field(default_factory=list)
+    policy_violation: bool = False
+    extra_changed_files: list[str] = field(default_factory=list)
+    forbidden_changed_files: list[str] = field(default_factory=list)
+    git_status_available: bool = False
+    git_status_error: str | None = None
     summary: str = ""
     error: str | None = None
+    done_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+@dataclass
+class OpenCodeServer:
+    server_id: str
+    url: str
+    hostname: str
+    port: int
+    working_dir: str
+    command: list[str]
+    status: str = "starting"
+    pid: int | None = None
+    exit_code: int | None = None
+    started_at: str = field(default_factory=lambda: utc_now())
+    finished_at: str | None = None
+    process: subprocess.Popen[str] | None = None
+    stdout_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
+    stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=TAIL_LINES))
+    error: str | None = None
+    stop_requested: bool = False
     done_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -71,14 +121,52 @@ def resolve_opencode() -> str:
     return shutil.which("opencode") or shutil.which("opencode.cmd") or "opencode"
 
 
-def build_opencode_command(prompt: str) -> list[str]:
-    return [
+def build_opencode_command(
+    prompt: str,
+    *,
+    working_dir: str | None = None,
+    server_url: str | None = None,
+    session_id: str | None = None,
+    continue_last: bool = False,
+    fork_session: bool = False,
+    title: str | None = None,
+) -> list[str]:
+    cmd = [
         resolve_opencode(),
         "run",
+    ]
+    if server_url is not None:
+        cmd.extend(["--attach", server_url])
+        if working_dir is not None:
+            cmd.extend(["--dir", working_dir])
+
+    cmd.extend([
         "--format",
         "json",
         "--dangerously-skip-permissions",
-        prompt,
+    ])
+
+    if session_id:
+        cmd.extend(["--session", session_id])
+    if continue_last:
+        cmd.append("--continue")
+    if fork_session:
+        cmd.append("--fork")
+    if title:
+        cmd.extend(["--title", title])
+
+    cmd.append(prompt)
+    return cmd
+
+
+def build_opencode_server_command(hostname: str, port: int) -> list[str]:
+    return [
+        resolve_opencode(),
+        "serve",
+        "--hostname",
+        hostname,
+        "--port",
+        str(port),
     ]
 
 
@@ -120,6 +208,62 @@ def normalize_working_dir(working_dir: str) -> tuple[str, str]:
     return str(resolved), normalized
 
 
+def normalize_git_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip()
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def git_path_key(path: str) -> str:
+    normalized = normalize_git_path(path)
+    if os.name == "nt":
+        return normalized.casefold()
+    return normalized
+
+
+def unique_sorted_paths(paths: list[str]) -> list[str]:
+    by_key: dict[str, str] = {}
+    for path in paths:
+        normalized = normalize_git_path(path)
+        if not normalized:
+            continue
+        by_key.setdefault(git_path_key(normalized), normalized)
+    return sorted(by_key.values(), key=lambda item: item.casefold())
+
+
+def sort_paths(paths: list[str]) -> list[str]:
+    return sorted(paths, key=lambda item: item.casefold())
+
+
+def normalize_abs_path_key(working_dir: str, path: str) -> str:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(working_dir) / candidate
+    resolved = candidate.resolve(strict=False)
+    normalized = os.path.normcase(os.path.realpath(str(resolved)))
+    return normalized.rstrip("\\/")
+
+
+def path_matches_policy(working_dir: str, changed_file: str, policy_path: str) -> bool:
+    changed_key = normalize_abs_path_key(working_dir, changed_file)
+    policy_key = normalize_abs_path_key(working_dir, policy_path)
+    if changed_key == policy_key:
+        return True
+    separator = os.sep
+    return changed_key.startswith(policy_key + separator)
+
+
+def get_path_policy_summary(job: OpenCodeJob) -> dict:
+    return {
+        "allowed_paths": list(job.allowed_paths) if job.allowed_paths is not None else None,
+        "forbidden_paths": list(job.forbidden_paths) if job.forbidden_paths is not None else None,
+        "checked_files_basis": "new_changed_files",
+        "match_rule": "same path or descendant path; relative paths resolve against working_dir",
+        "case_sensitive": os.name != "nt",
+    }
+
+
 def summarize_command(cmd: list[str], prompt: str) -> str:
     prompt_hash = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:12]
     if not cmd:
@@ -138,24 +282,60 @@ def tail_to_text(lines: deque[str]) -> str:
     return trim_tail("".join(lines))
 
 
-def append_tail(job: OpenCodeJob, kind: str, text: str) -> None:
+def find_session_id(value) -> str | None:
+    if isinstance(value, dict):
+        session_id = value.get("sessionID")
+        if isinstance(session_id, str) and session_id:
+            return session_id
+        for nested in value.values():
+            found = find_session_id(nested)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = find_session_id(item)
+            if found:
+                return found
+    return None
+
+
+def parse_session_id_from_text(text: str) -> str | None:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        found = find_session_id(event)
+        if found:
+            return found
+    return None
+
+
+def append_tail(target, kind: str, text: str) -> None:
     if len(text) > MAX_TAIL_CHARS:
         text = text[-MAX_TAIL_CHARS:]
-    with job.lock:
+    with target.lock:
         if kind == "stdout":
-            job.stdout_tail.append(text)
+            target.stdout_tail.append(text)
+            if hasattr(target, "session_id"):
+                session_id = parse_session_id_from_text(text)
+                if session_id:
+                    target.session_id = session_id
         else:
-            job.stderr_tail.append(text)
+            target.stderr_tail.append(text)
 
 
-def read_stream(job: OpenCodeJob, stream, kind: str) -> None:
+def read_stream(target, stream, kind: str) -> None:
     try:
         for line in iter(stream.readline, ""):
             if not line:
                 break
-            append_tail(job, kind, line)
+            append_tail(target, kind, line)
     except Exception as exc:  # pragma: no cover - defensive reader guard
-        append_tail(job, "stderr", f"[opencode_coder] Failed to read {kind}: {exc}\n")
+        append_tail(target, "stderr", f"[opencode_coder] Failed to read {kind}: {exc}\n")
     finally:
         try:
             stream.close()
@@ -204,10 +384,198 @@ def find_active_job_for_cwd_locked(cwd_key: str) -> OpenCodeJob | None:
     return None
 
 
-def collect_changed_files(working_dir: str) -> list[str]:
+def choose_free_port(hostname: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((hostname, 0))
+        return int(sock.getsockname()[1])
+
+
+def is_server_running(server: OpenCodeServer) -> bool:
+    with server.lock:
+        return server.process is not None and server.process.poll() is None
+
+
+def refresh_server_status(server: OpenCodeServer) -> None:
+    with server.lock:
+        if server.process is None:
+            return
+        exit_code = server.process.poll()
+        if exit_code is None:
+            if server.status in {"starting", "ready"}:
+                server.status = "running"
+            return
+        if not server.done_event.is_set():
+            server.exit_code = exit_code
+            server.finished_at = utc_now()
+            server.status = "stopped" if exit_code == 0 or server.stop_requested else "failed"
+            if server.status == "failed" and server.error is None:
+                server.error = f"opencode serve exited with code {exit_code}"
+            server.done_event.set()
+
+
+def server_to_result(server: OpenCodeServer) -> dict:
+    refresh_server_status(server)
+    with server.lock:
+        stdout_tail = tail_to_text(server.stdout_tail)
+        stderr_tail = tail_to_text(server.stderr_tail)
+        process_running = server.process is not None and server.process.poll() is None
+        return {
+            "server_id": server.server_id,
+            "url": server.url,
+            "hostname": server.hostname,
+            "port": server.port,
+            "working_dir": server.working_dir,
+            "pid": server.pid,
+            "status": server.status,
+            "exit_code": server.exit_code,
+            "started_at": server.started_at,
+            "finished_at": server.finished_at,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "process_running": process_running,
+            "command": " ".join(server.command),
+            "success": server.status in {"running", "stopped"} and server.error is None,
+            "error": server.error,
+        }
+
+
+def monitor_server(server: OpenCodeServer, reader_threads: list[threading.Thread]) -> None:
+    exit_code: int | None = None
+    error: str | None = None
+    try:
+        if server.process is None:
+            error = "process was not started"
+        else:
+            exit_code = server.process.wait()
+    except Exception as exc:  # pragma: no cover - defensive process guard
+        error = str(exc)
+
+    for thread in reader_threads:
+        thread.join(timeout=2)
+
+    with server.lock:
+        server.exit_code = exit_code
+        server.finished_at = utc_now()
+        server.error = error
+        if error is not None:
+            server.status = "failed"
+        elif exit_code == 0 or server.stop_requested:
+            server.status = "stopped"
+        else:
+            server.status = "failed"
+            server.error = f"opencode serve exited with code {exit_code}"
+        server.done_event.set()
+
+
+def wait_for_server_port(server: OpenCodeServer, timeout_seconds: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        refresh_server_status(server)
+        if server.done_event.is_set():
+            return False
+        try:
+            with socket.create_connection((server.hostname, server.port), timeout=0.25):
+                with server.lock:
+                    server.status = "running"
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def make_server_not_found_result(server_id: str) -> dict:
+    return {
+        "server_id": server_id,
+        "url": None,
+        "hostname": None,
+        "port": None,
+        "working_dir": None,
+        "pid": None,
+        "status": "not_found",
+        "exit_code": None,
+        "started_at": None,
+        "finished_at": None,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "process_running": False,
+        "command": None,
+        "success": False,
+        "error": "server_not_found",
+    }
+
+
+def parse_git_status_entries(stdout: str) -> dict[str, tuple[str, str]]:
+    entries: dict[str, tuple[str, str]] = {}
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        status_code = line[:2] if len(line) >= 2 else "??"
+        path = line[3:] if len(line) > 3 else line
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        normalized_path = normalize_git_path(path.strip().strip('"'))
+        if normalized_path:
+            entries[git_path_key(normalized_path)] = (normalized_path, status_code)
+    return entries
+
+
+def file_fingerprint(working_dir: str, path: str, status_code: str) -> str:
+    absolute_path = Path(working_dir) / path
+    try:
+        stat_result = absolute_path.lstat()
+    except OSError:
+        return f"{status_code}|missing"
+
+    if absolute_path.is_symlink():
+        try:
+            target = os.readlink(absolute_path)
+        except OSError as exc:
+            target = f"<readlink-error:{exc}>"
+        return f"{status_code}|symlink|{target}"
+
+    if absolute_path.is_file():
+        digest = hashlib.sha256()
+        try:
+            with absolute_path.open("rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            return f"{status_code}|file-read-error|{stat_result.st_size}|{exc}"
+        return f"{status_code}|file|{stat_result.st_size}|{digest.hexdigest()}"
+
+    if absolute_path.is_dir():
+        return f"{status_code}|dir|{stat_result.st_mtime_ns}"
+
+    return f"{status_code}|other|{stat_result.st_mode}|{stat_result.st_size}|{stat_result.st_mtime_ns}"
+
+
+def build_git_status_snapshot(working_dir: str, stdout: str) -> GitStatusSnapshot:
+    entries = parse_git_status_entries(stdout)
+    files_by_key = {key: path for key, (path, _status_code) in entries.items()}
+    fingerprints = {
+        key: file_fingerprint(working_dir, path, status_code)
+        for key, (path, status_code) in entries.items()
+    }
+    return GitStatusSnapshot(
+        available=True,
+        files=sort_paths(list(files_by_key.values())),
+        fingerprints=fingerprints,
+    )
+
+
+def collect_git_status(working_dir: str) -> GitStatusSnapshot:
     try:
         result = subprocess.run(
-            ["git", "-C", working_dir, "status", "--porcelain=v1", "--untracked-files=all"],
+            [
+                "git",
+                "-C",
+                working_dir,
+                "-c",
+                "core.quotepath=false",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -215,29 +583,87 @@ def collect_changed_files(working_dir: str) -> list[str]:
             errors="replace",
             timeout=5,
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        return GitStatusSnapshot(available=False, error=str(exc))
 
     if result.returncode != 0:
-        return []
+        error = (result.stderr or result.stdout or "git status failed").strip()
+        return GitStatusSnapshot(available=False, error=trim_tail(error))
 
-    changed: list[str] = []
-    for line in result.stdout.splitlines():
-        if not line:
+    return build_git_status_snapshot(working_dir, result.stdout)
+
+
+def evaluate_path_policy(
+    working_dir: str,
+    new_changed_files: list[str],
+    allowed_paths: list[str] | None,
+    forbidden_paths: list[str] | None,
+) -> tuple[bool, list[str], list[str]]:
+    allowed = [path for path in list(allowed_paths or []) if str(path).strip()]
+    forbidden = [path for path in list(forbidden_paths or []) if str(path).strip()]
+    forbidden_changed_files: list[str] = []
+    extra_changed_files: list[str] = []
+
+    for changed_file in new_changed_files:
+        if any(path_matches_policy(working_dir, changed_file, forbidden_path) for forbidden_path in forbidden):
+            forbidden_changed_files.append(changed_file)
             continue
-        path = line[3:] if len(line) > 3 else line
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        changed.append(path.strip().strip('"'))
-    return changed
+
+        if allowed and not any(path_matches_policy(working_dir, changed_file, allowed_path) for allowed_path in allowed):
+            extra_changed_files.append(changed_file)
+
+    policy_violation = bool(forbidden_changed_files or extra_changed_files)
+    return policy_violation, extra_changed_files, forbidden_changed_files
+
+
+def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_preexisting: bool = False) -> None:
+    with job.lock:
+        if set_preexisting:
+            job.preexisting_changed_files = list(snapshot.files) if snapshot.available else []
+            job.preexisting_file_fingerprints = dict(snapshot.fingerprints) if snapshot.available else {}
+
+        all_changed_files = list(snapshot.files) if snapshot.available else []
+        current_files_by_key = {git_path_key(path): path for path in all_changed_files}
+        preexisting_files_by_key = {
+            git_path_key(path): path
+            for path in job.preexisting_changed_files
+        }
+        changed_during_job_keys = [
+            key
+            for key in sorted(set(current_files_by_key) | set(job.preexisting_file_fingerprints))
+            if snapshot.fingerprints.get(key) != job.preexisting_file_fingerprints.get(key)
+        ]
+        new_changed_files = sort_paths([
+            current_files_by_key.get(key) or preexisting_files_by_key.get(key) or key
+            for key in changed_during_job_keys
+        ])
+        policy_violation, extra_changed_files, forbidden_changed_files = evaluate_path_policy(
+            job.working_dir,
+            new_changed_files,
+            job.allowed_paths,
+            job.forbidden_paths,
+        )
+
+        job.all_changed_files = all_changed_files
+        job.new_changed_files = new_changed_files
+        job.changed_files = all_changed_files
+        job.policy_violation = policy_violation
+        job.extra_changed_files = extra_changed_files
+        job.forbidden_changed_files = forbidden_changed_files
+        job.git_status_available = snapshot.available
+        job.git_status_error = snapshot.error
+
+
+def refresh_job_snapshot(job: OpenCodeJob) -> None:
+    apply_git_snapshot(job, collect_git_status(job.working_dir))
 
 
 def finish_job(job: OpenCodeJob, exit_code: int | None, error: str | None = None) -> None:
-    changed_files = collect_changed_files(job.working_dir)
+    final_snapshot = collect_git_status(job.working_dir)
+    apply_git_snapshot(job, final_snapshot)
     with job.lock:
         job.exit_code = exit_code
         job.finished_at = utc_now()
-        job.changed_files = changed_files
         job.error = error
         if error is not None:
             job.status = "failed"
@@ -314,6 +740,9 @@ def job_to_result(
     new_job_started: bool = True,
     summary_override: str | None = None,
 ) -> dict:
+    if is_job_active(job):
+        refresh_job_snapshot(job)
+
     with job.lock:
         stdout_tail = tail_to_text(job.stdout_tail)
         stderr_tail = tail_to_text(job.stderr_tail)
@@ -340,7 +769,20 @@ def job_to_result(
             "pid": job.pid,
             "exit_code": job.exit_code,
             "summary": summary,
+            "session_id": job.session_id,
+            "server_id": job.server_id,
+            "server_url": job.server_url,
+            "attached_to_server": job.attached_to_server,
             "changed_files": list(job.changed_files),
+            "preexisting_changed_files": list(job.preexisting_changed_files),
+            "all_changed_files": list(job.all_changed_files),
+            "new_changed_files": list(job.new_changed_files),
+            "policy_violation": job.policy_violation,
+            "extra_changed_files": list(job.extra_changed_files),
+            "forbidden_changed_files": list(job.forbidden_changed_files),
+            "path_policy": get_path_policy_summary(job),
+            "git_status_available": job.git_status_available,
+            "git_status_error": job.git_status_error,
             "tests_run": [],
             "validation_skipped_reason": "MCP wrapper does not run validation; inspect OpenCode output or task-level tooling.",
             "stdout_tail": stdout_tail,
@@ -370,6 +812,12 @@ def make_start_failed_result(
     requested_timeout_seconds: float,
     effective_timeout_seconds: float,
     timeout_policy: str,
+    allowed_paths: list[str] | None,
+    forbidden_paths: list[str] | None,
+    server_id: str | None,
+    server_url: str | None,
+    session_id: str | None,
+    attached_to_server: bool,
     error: str,
 ) -> dict:
     job = OpenCodeJob(
@@ -381,6 +829,12 @@ def make_start_failed_result(
         requested_timeout_seconds=requested_timeout_seconds,
         effective_timeout_seconds=effective_timeout_seconds,
         timeout_policy=timeout_policy,
+        allowed_paths=allowed_paths,
+        forbidden_paths=forbidden_paths,
+        server_id=server_id,
+        server_url=server_url,
+        session_id=session_id,
+        attached_to_server=attached_to_server,
         status="failed",
         exit_code=None,
         finished_at=utc_now(),
@@ -398,11 +852,91 @@ def start_job(
     working_dir: str,
     timeout_seconds: float | int | None,
     allow_concurrent: bool,
+    allowed_paths: list[str] | None,
+    forbidden_paths: list[str] | None,
+    server_id: str | None,
+    session_id: str | None,
+    continue_last: bool,
+    fork_session: bool,
+    title: str | None,
 ) -> tuple[OpenCodeJob | None, dict | None]:
     cleanup_jobs()
     requested_timeout, effective_timeout, timeout_policy = compute_effective_timeout(timeout_seconds)
     resolved_working_dir, cwd_key = normalize_working_dir(working_dir)
-    command = build_opencode_command(prompt)
+    server_url: str | None = None
+    attached_to_server = False
+
+    if server_id:
+        with _SERVER_REGISTRY_LOCK:
+            server = _SERVERS.get(server_id)
+        if server is None:
+            command = [
+                resolve_opencode(),
+                "run",
+                "--attach",
+                f"<missing server_id={server_id}>",
+                f"<prompt chars={len(prompt)}>",
+            ]
+            result = make_start_failed_result(
+                working_dir=resolved_working_dir,
+                cwd_key=cwd_key,
+                command=command,
+                command_summary=" ".join(command),
+                requested_timeout_seconds=requested_timeout,
+                effective_timeout_seconds=effective_timeout,
+                timeout_policy=timeout_policy,
+                allowed_paths=allowed_paths,
+                forbidden_paths=forbidden_paths,
+                server_id=server_id,
+                server_url=None,
+                session_id=session_id,
+                attached_to_server=False,
+                error=f"server_id not found: {server_id}",
+            )
+            return None, result
+
+        refresh_server_status(server)
+        if not is_server_running(server):
+            result = make_start_failed_result(
+                working_dir=resolved_working_dir,
+                cwd_key=cwd_key,
+                command=build_opencode_command(
+                    prompt,
+                    working_dir=resolved_working_dir,
+                    server_url=server.url,
+                    session_id=session_id,
+                    continue_last=continue_last,
+                    fork_session=fork_session,
+                    title=title,
+                ),
+                command_summary=(
+                    f"{Path(resolve_opencode()).name} run --attach {server.url} "
+                    f"<server not running> <prompt chars={len(prompt)}>"
+                ),
+                requested_timeout_seconds=requested_timeout,
+                effective_timeout_seconds=effective_timeout,
+                timeout_policy=timeout_policy,
+                allowed_paths=allowed_paths,
+                forbidden_paths=forbidden_paths,
+                server_id=server_id,
+                server_url=server.url,
+                session_id=session_id,
+                attached_to_server=True,
+                error=f"server_id is not running: {server_id}",
+            )
+            return None, result
+        server_url = server.url
+        attached_to_server = True
+
+    command = build_opencode_command(
+        prompt,
+        working_dir=resolved_working_dir if attached_to_server else None,
+        server_url=server_url,
+        session_id=session_id,
+        continue_last=continue_last,
+        fork_session=fork_session,
+        title=title,
+    )
     command_summary = summarize_command(command, prompt)
 
     if not Path(resolved_working_dir).is_dir():
@@ -414,6 +948,12 @@ def start_job(
             requested_timeout_seconds=requested_timeout,
             effective_timeout_seconds=effective_timeout,
             timeout_policy=timeout_policy,
+            allowed_paths=allowed_paths,
+            forbidden_paths=forbidden_paths,
+            server_id=server_id,
+            server_url=server_url,
+            session_id=session_id,
+            attached_to_server=attached_to_server,
             error=f"working_dir does not exist or is not a directory: {resolved_working_dir}",
         )
         return None, result
@@ -442,8 +982,16 @@ def start_job(
             requested_timeout_seconds=requested_timeout,
             effective_timeout_seconds=effective_timeout,
             timeout_policy=timeout_policy,
+            allowed_paths=allowed_paths,
+            forbidden_paths=forbidden_paths,
+            server_id=server_id,
+            server_url=server_url,
+            session_id=session_id,
+            attached_to_server=attached_to_server,
             summary="OpenCode process is starting.",
         )
+        initial_snapshot = collect_git_status(resolved_working_dir)
+        apply_git_snapshot(job, initial_snapshot, set_preexisting=True)
         _JOBS[job.job_id] = job
         _CWD_ACTIVE_JOBS.setdefault(cwd_key, set()).add(job.job_id)
 
@@ -498,14 +1046,169 @@ def start_job(
 
 
 @mcp.tool()
+def opencode_server_start(
+    working_dir: str = ".",
+    hostname: str = "127.0.0.1",
+    port: int = 0,
+) -> dict:
+    """启动由 MCP 托管的 opencode headless server。"""
+    resolved_working_dir, _cwd_key = normalize_working_dir(working_dir)
+    server_port = choose_free_port(hostname) if port == 0 else int(port)
+    url = f"http://{hostname}:{server_port}"
+    command = build_opencode_server_command(hostname, server_port)
+    server = OpenCodeServer(
+        server_id=uuid.uuid4().hex,
+        url=url,
+        hostname=hostname,
+        port=server_port,
+        working_dir=resolved_working_dir,
+        command=command,
+    )
+
+    with _SERVER_REGISTRY_LOCK:
+        _SERVERS[server.server_id] = server
+
+    if not Path(resolved_working_dir).is_dir():
+        with server.lock:
+            server.status = "failed"
+            server.finished_at = utc_now()
+            server.error = f"working_dir does not exist or is not a directory: {resolved_working_dir}"
+            server.done_event.set()
+        return server_to_result(server)
+
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen(
+            command,
+            cwd=resolved_working_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        with server.lock:
+            server.status = "failed"
+            server.finished_at = utc_now()
+            server.error = str(exc)
+            server.done_event.set()
+        return server_to_result(server)
+
+    with server.lock:
+        server.process = process
+        server.pid = process.pid
+        server.status = "starting"
+
+    stdout_thread = threading.Thread(
+        target=read_stream,
+        args=(server, process.stdout, "stdout"),
+        name=f"opencode-server-{server.server_id}-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=read_stream,
+        args=(server, process.stderr, "stderr"),
+        name=f"opencode-server-{server.server_id}-stderr",
+        daemon=True,
+    )
+    reader_threads = [stdout_thread, stderr_thread]
+    for thread in reader_threads:
+        thread.start()
+
+    monitor_thread = threading.Thread(
+        target=monitor_server,
+        args=(server, reader_threads),
+        name=f"opencode-server-{server.server_id}-monitor",
+        daemon=True,
+    )
+    monitor_thread.start()
+
+    if wait_for_server_port(server):
+        return server_to_result(server)
+
+    with server.lock:
+        if server.error is None:
+            server.error = f"Timed out waiting for {url} to accept connections."
+        server.status = "failed"
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+    return server_to_result(server)
+
+
+@mcp.tool()
+def opencode_server_status(server_id: str) -> dict:
+    """查询 MCP 托管 opencode server 的运行状态。"""
+    with _SERVER_REGISTRY_LOCK:
+        server = _SERVERS.get(server_id)
+    if server is None:
+        return make_server_not_found_result(server_id)
+    return server_to_result(server)
+
+
+@mcp.tool()
+def opencode_server_stop(server_id: str) -> dict:
+    """停止 MCP 托管 opencode server。"""
+    with _SERVER_REGISTRY_LOCK:
+        server = _SERVERS.get(server_id)
+    if server is None:
+        return make_server_not_found_result(server_id)
+
+    process = server.process
+    if process is not None and process.poll() is None:
+        with server.lock:
+            server.status = "stopping"
+            server.stop_requested = True
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    server.done_event.wait(timeout=2)
+    refresh_server_status(server)
+    return server_to_result(server)
+
+
+@mcp.tool()
 def opencode_coder(
     prompt: str,
     working_dir: str = ".",
     timeout_seconds: float = DEFAULT_WAIT_SECONDS,
     allow_concurrent: bool = False,
+    allowed_paths: list[str] | None = None,
+    forbidden_paths: list[str] | None = None,
+    server_id: str | None = None,
+    session_id: str | None = None,
+    continue_last: bool = False,
+    fork_session: bool = False,
+    title: str | None = None,
 ) -> dict:
     """调用 OpenCode 在指定项目目录里编写或修改代码，并返回可查询的结构化 job 结果。"""
-    job, early_result = start_job(prompt, working_dir, timeout_seconds, allow_concurrent)
+    job, early_result = start_job(
+        prompt,
+        working_dir,
+        timeout_seconds,
+        allow_concurrent,
+        allowed_paths,
+        forbidden_paths,
+        server_id,
+        session_id,
+        continue_last,
+        fork_session,
+        title,
+    )
     if early_result is not None:
         return early_result
     if job is None:
@@ -542,7 +1245,20 @@ def opencode_coder_status(job_id: str) -> dict:
                 "Job id was not found. It may be invalid, belong to another MCP server process, "
                 "or have expired from the in-memory retention window."
             ),
+            "session_id": None,
+            "server_id": None,
+            "server_url": None,
+            "attached_to_server": False,
             "changed_files": [],
+            "preexisting_changed_files": [],
+            "all_changed_files": [],
+            "new_changed_files": [],
+            "policy_violation": False,
+            "extra_changed_files": [],
+            "forbidden_changed_files": [],
+            "path_policy": None,
+            "git_status_available": False,
+            "git_status_error": "job_not_found",
             "tests_run": [],
             "validation_skipped_reason": "No job was found to validate.",
             "stdout_tail": "",
@@ -584,6 +1300,24 @@ def _reset_jobs_for_tests() -> None:
     with _REGISTRY_LOCK:
         _JOBS.clear()
         _CWD_ACTIVE_JOBS.clear()
+
+
+def _reset_servers_for_tests() -> None:
+    with _SERVER_REGISTRY_LOCK:
+        servers = list(_SERVERS.values())
+
+    for server in servers:
+        process = server.process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+    with _SERVER_REGISTRY_LOCK:
+        _SERVERS.clear()
 
 
 if __name__ == "__main__":
