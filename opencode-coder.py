@@ -37,6 +37,9 @@ DEFAULT_DIFF_MAX_CHARS = 20_000
 MAX_DIFF_CHARS = 200_000
 MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES = 50
 MAX_PATH_POLICY_DIAGNOSTIC_CHARS = 300
+RECENT_EVENT_LIMIT = 20
+DEFAULT_RECENT_EVENTS_LIMIT = 5
+EVENT_TEXT_PREVIEW_CHARS = 300
 STALL_NO_ACTIVITY_SECONDS = 120.0
 STALL_NO_OUTPUT_SECONDS = 120.0
 STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = 120.0
@@ -78,6 +81,9 @@ class OpenCodeJob:
     server_id: str | None = None
     server_url: str | None = None
     session_id: str | None = None
+    requested_session_id: str | None = None
+    continue_last: bool = False
+    fork_session: bool = False
     attached_to_server: bool = False
     server_recovered_from_registry: bool = False
     status: str = "starting"
@@ -94,6 +100,17 @@ class OpenCodeJob:
     stderr_buffer_start: int = 0
     stdout_cursor: int = 0
     stderr_cursor: int = 0
+    last_event_type: str | None = None
+    last_event_at: str | None = None
+    last_event_summary: dict | None = None
+    recent_events: deque[dict] = field(default_factory=lambda: deque(maxlen=RECENT_EVENT_LIMIT))
+    recent_event_count: int = 0
+    last_text_output: str | None = None
+    last_tool_name: str | None = None
+    last_tool_event: dict | None = None
+    last_step_reason: str | None = None
+    last_step_status: str | None = None
+    last_session_id: str | None = None
     preexisting_changed_files: list[str] = field(default_factory=list)
     preexisting_file_fingerprints: dict[str, str] = field(default_factory=dict)
     all_changed_files: list[str] = field(default_factory=list)
@@ -356,6 +373,32 @@ def clamp_tail_max_chars(tail_max_chars, *, default: int = MAX_TAIL_CHARS) -> in
     except (TypeError, ValueError):
         parsed = default
     return min(max(parsed, 0), MAX_TAIL_CHARS)
+
+
+def clamp_recent_events_limit(recent_events_limit) -> int:
+    try:
+        parsed = int(recent_events_limit)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_RECENT_EVENTS_LIMIT
+    return min(max(parsed, 0), RECENT_EVENT_LIMIT)
+
+
+def clamp_delta_max_chars(delta_max_chars) -> int | None:
+    if delta_max_chars is None:
+        return None
+    try:
+        parsed = int(delta_max_chars)
+    except (TypeError, ValueError):
+        return None
+    return min(max(parsed, 0), MAX_DELTA_BUFFER_CHARS)
+
+
+def truncate_delta_for_response(delta: str, delta_max_chars: int | None) -> tuple[str, bool]:
+    if delta_max_chars is None or len(delta) <= delta_max_chars:
+        return delta, False
+    if delta_max_chars == 0:
+        return "", True
+    return delta[-delta_max_chars:], True
 
 
 def get_server_registry_path() -> str:
@@ -963,6 +1006,248 @@ def parse_session_id_from_text(text: str) -> str | None:
     return None
 
 
+def preview_event_text(value, max_chars: int = EVENT_TEXT_PREVIEW_CHARS) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        except Exception:
+            text = str(value)
+
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...[truncated]"
+
+
+def coerce_short_string(value) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return None
+
+
+def find_string_by_keys(value, keys: tuple[str, ...]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            found = coerce_short_string(value.get(key))
+            if found:
+                return found
+        for nested in value.values():
+            found = find_string_by_keys(nested, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = find_string_by_keys(item, keys)
+            if found:
+                return found
+    return None
+
+
+def find_part_dict(value) -> dict | None:
+    if isinstance(value, dict):
+        for key in ("part", "inputPart", "outputPart"):
+            part = value.get(key)
+            if isinstance(part, dict):
+                return part
+        for key in ("parts", "content"):
+            items = value.get(key)
+            if isinstance(items, list):
+                for item in reversed(items):
+                    if isinstance(item, dict):
+                        return item
+        for key in ("data", "message", "body", "payload"):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)):
+                found = find_part_dict(nested)
+                if found is not None:
+                    return found
+    elif isinstance(value, list):
+        for item in reversed(value):
+            found = find_part_dict(item)
+            if found is not None:
+                return found
+    return None
+
+
+def extract_event_type(event: dict) -> str:
+    return (
+        coerce_short_string(event.get("type"))
+        or coerce_short_string(event.get("event"))
+        or coerce_short_string(event.get("eventType"))
+        or coerce_short_string(event.get("event_type"))
+        or "json_event"
+    )
+
+
+def extract_part_type(event: dict, part: dict | None) -> str | None:
+    if part is not None:
+        found = (
+            coerce_short_string(part.get("type"))
+            or coerce_short_string(part.get("partType"))
+            or coerce_short_string(part.get("kind"))
+        )
+        if found:
+            return found
+    return (
+        coerce_short_string(event.get("part_type"))
+        or coerce_short_string(event.get("partType"))
+        or coerce_short_string(event.get("kind"))
+    )
+
+
+def find_tool_name(value) -> str | None:
+    if isinstance(value, dict):
+        for key in ("toolName", "tool_name"):
+            found = coerce_short_string(value.get(key))
+            if found:
+                return found
+
+        tool = value.get("tool")
+        if isinstance(tool, str) and tool.strip():
+            return tool.strip()
+        if isinstance(tool, dict):
+            found = (
+                coerce_short_string(tool.get("name"))
+                or coerce_short_string(tool.get("id"))
+                or find_tool_name(tool)
+            )
+            if found:
+                return found
+
+        type_value = coerce_short_string(value.get("type")) or ""
+        name = coerce_short_string(value.get("name"))
+        if name and "tool" in type_value.lower():
+            return name
+
+        for nested in value.values():
+            found = find_tool_name(nested)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = find_tool_name(item)
+            if found:
+                return found
+    return None
+
+
+def extract_event_text(event: dict, part: dict | None) -> str | None:
+    text_keys = ("text", "delta", "content", "output")
+    if part is not None:
+        for key in text_keys:
+            found = coerce_short_string(part.get(key))
+            if found:
+                return found
+    return find_string_by_keys(event, text_keys)
+
+
+def summarize_opencode_event(event: dict, observed_at: str) -> dict:
+    part = find_part_dict(event)
+    event_type = extract_event_type(event)
+    summary = {
+        "type": event_type,
+        "timestamp": (
+            find_string_by_keys(event, ("timestamp", "time", "createdAt", "created_at"))
+            or observed_at
+        ),
+    }
+
+    session_id = find_session_id(event)
+    if session_id:
+        summary["sessionID"] = session_id
+
+    message_id = find_string_by_keys(event, ("messageID", "messageId", "message_id"))
+    if message_id:
+        summary["messageID"] = message_id
+
+    part_type = extract_part_type(event, part)
+    if part_type:
+        summary["part_type"] = part_type
+
+    tool_name = find_tool_name(event)
+    if tool_name:
+        summary["tool_name"] = tool_name
+
+    text_preview = preview_event_text(extract_event_text(event, part))
+    if text_preview:
+        summary["text_preview"] = text_preview
+
+    reason = find_string_by_keys(event, ("reason", "finishReason", "finish_reason", "stopReason", "stop_reason"))
+    if reason:
+        summary["reason"] = preview_event_text(reason, 120)
+
+    status = find_string_by_keys(event, ("status", "state"))
+    if status:
+        summary["status"] = preview_event_text(status, 120)
+
+    return summary
+
+
+def summary_has_tool_activity(summary: dict) -> bool:
+    event_type = str(summary.get("type") or "").lower()
+    part_type = str(summary.get("part_type") or "").lower()
+    return bool(summary.get("tool_name") or "tool" in event_type or "tool" in part_type)
+
+
+def summary_has_text_activity(summary: dict) -> bool:
+    event_type = str(summary.get("type") or "").lower()
+    part_type = str(summary.get("part_type") or "").lower()
+    return bool(
+        summary.get("text_preview")
+        and not summary_has_tool_activity(summary)
+        and ("text" in event_type or "text" in part_type or "message" in event_type or not part_type)
+    )
+
+
+def record_stdout_event_diagnostics_locked(target, text: str, observed_at: str) -> None:
+    if not hasattr(target, "recent_events"):
+        return
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        summary = summarize_opencode_event(event, observed_at)
+        target.recent_events.append(summary)
+        target.recent_event_count += 1
+        target.last_event_type = summary.get("type")
+        target.last_event_at = summary.get("timestamp")
+        target.last_event_summary = dict(summary)
+
+        session_id = summary.get("sessionID")
+        if session_id:
+            target.last_session_id = session_id
+
+        if summary_has_text_activity(summary):
+            target.last_text_output = summary.get("text_preview")
+
+        if summary_has_tool_activity(summary):
+            target.last_tool_name = summary.get("tool_name")
+            target.last_tool_event = dict(summary)
+
+        event_type = str(summary.get("type") or "").lower()
+        part_type = str(summary.get("part_type") or "").lower()
+        if "step" in event_type or "step" in part_type or summary.get("reason"):
+            if summary.get("status"):
+                target.last_step_status = summary.get("status")
+            if summary.get("reason"):
+                target.last_step_reason = summary.get("reason")
+
+
 def append_tail(target, kind: str, text: str) -> None:
     output_text = text
     tail_text = text
@@ -979,6 +1264,7 @@ def append_tail(target, kind: str, text: str) -> None:
                 target.last_activity_at = now
                 target.output_version += 1
                 target.output_event.set()
+                record_stdout_event_diagnostics_locked(target, output_text, now)
                 session_id = parse_session_id_from_text(output_text)
                 if session_id:
                     target.session_id = session_id
@@ -1833,6 +2119,55 @@ def build_change_risk_fields(job: OpenCodeJob, status: str) -> dict:
     }
 
 
+def session_reuse_requested(job: OpenCodeJob) -> bool:
+    return bool(job.requested_session_id or job.continue_last or job.fork_session)
+
+
+def has_effective_output(*values: str | None) -> bool:
+    return any(bool(value and value.strip()) for value in values)
+
+
+def build_no_event_noop_diagnostics(
+    job: OpenCodeJob,
+    *,
+    status: str,
+    stdout_tail: str,
+    stderr_tail: str,
+    stdout_delta: str,
+    stderr_delta: str,
+) -> dict:
+    no_event_noop_reason = "completed_attached_session_reuse_without_events_changes_or_output"
+    no_event_noop_risk = (
+        status == "completed"
+        and job.exit_code == 0
+        and (job.attached_to_server or bool(job.server_id))
+        and session_reuse_requested(job)
+        and job.recent_event_count == 0
+        and not job.new_changed_files
+        and not has_effective_output(
+            stdout_tail,
+            stderr_tail,
+            stdout_delta,
+            stderr_delta,
+            job.stdout_buffer,
+            job.stderr_buffer,
+        )
+    )
+    return {
+        "no_event_noop_risk": no_event_noop_risk,
+        "no_event_noop_reason": no_event_noop_reason if no_event_noop_risk else None,
+    }
+
+
+def build_no_event_noop_note() -> str:
+    return (
+        "OpenCode completed with no stdout JSON events and no job-scoped changes; "
+        "session reuse may have no-oped. Do not treat completed/success as normal completion "
+        "without review; check the session scope or retry without session_id, a fresh session, "
+        "or a fresh server."
+    )
+
+
 def build_validation_note(status: str) -> str:
     base = (
         "The MCP wrapper does not run validation. A prompt asking OpenCode to run validation "
@@ -1844,6 +2179,124 @@ def build_validation_note(status: str) -> str:
     return base
 
 
+def event_summary_phase(summary: dict | None) -> str:
+    if not summary:
+        return "no_event_seen"
+
+    event_type = str(summary.get("type") or "").lower()
+    part_type = str(summary.get("part_type") or "").lower()
+    status = str(summary.get("status") or "").lower()
+    reason = str(summary.get("reason") or "").lower()
+
+    finished_markers = ("finish", "finished", "complete", "completed", "done", "success", "failed", "error", "stop")
+    started_markers = ("start", "started", "running", "pending")
+
+    if "step" in event_type or "step" in part_type:
+        if any(marker in status for marker in finished_markers) or any(marker in event_type for marker in finished_markers):
+            return "step_finished"
+        if any(marker in status for marker in started_markers) or any(marker in event_type for marker in started_markers):
+            return "step_started"
+        return "step_started"
+
+    if reason and any(marker in reason for marker in finished_markers):
+        return "step_finished"
+
+    if summary_has_tool_activity(summary):
+        return "tool_activity"
+    if summary_has_text_activity(summary):
+        return "model_text"
+    return "unknown"
+
+
+def build_event_diagnostics_locked(
+    job: OpenCodeJob,
+    *,
+    status: str,
+    process_running: bool,
+    stall_diagnostics: dict,
+    recent_events_limit: int = DEFAULT_RECENT_EVENTS_LIMIT,
+) -> dict:
+    last_event_summary = dict(job.last_event_summary) if job.last_event_summary else None
+    last_event_phase = event_summary_phase(last_event_summary)
+    effective_recent_events_limit = clamp_recent_events_limit(recent_events_limit)
+    if effective_recent_events_limit > 0:
+        recent_events = [dict(event) for event in list(job.recent_events)[-effective_recent_events_limit:]]
+    else:
+        recent_events = []
+
+    if status in {"completed", "failed", "cancelled"} or (not process_running and job.finished_at is not None):
+        diagnostic_phase = "process_finished"
+    elif job.recent_event_count <= 0:
+        diagnostic_phase = "no_event_seen"
+    elif process_running and stall_diagnostics["is_stalled"]:
+        diagnostic_phase = "process_running_no_recent_event"
+    elif last_event_phase in {"model_text", "tool_activity", "step_started", "step_finished"}:
+        diagnostic_phase = last_event_phase
+    else:
+        diagnostic_phase = "unknown"
+
+    last_event_at = job.last_event_at or "unknown time"
+    if job.recent_event_count <= 0:
+        if process_running:
+            diagnostic_note = "No OpenCode stdout JSON event has been observed yet; process is still running."
+        else:
+            diagnostic_note = f"No OpenCode stdout JSON event was observed before process reached status {status}."
+    elif stall_diagnostics["is_stalled"]:
+        diagnostic_note = (
+            f"Job is stalled ({stall_diagnostics['stall_reason']}); last observed OpenCode stdout "
+            f"JSON event phase was {last_event_phase} at {last_event_at}."
+        )
+    elif diagnostic_phase == "process_finished":
+        diagnostic_note = (
+            f"OpenCode process reached status {status}; last observed stdout JSON event phase was "
+            f"{last_event_phase} at {last_event_at}."
+        )
+    elif process_running:
+        diagnostic_note = (
+            f"OpenCode process is running; last observed stdout JSON event phase was "
+            f"{last_event_phase} at {last_event_at}."
+        )
+    else:
+        diagnostic_note = (
+            f"Last observed OpenCode stdout JSON event phase was {last_event_phase} "
+            f"at {last_event_at}."
+        )
+
+    return {
+        "last_event_type": job.last_event_type,
+        "last_event_at": job.last_event_at,
+        "last_event_summary": last_event_summary,
+        "recent_events": recent_events,
+        "recent_event_count": job.recent_event_count,
+        "last_text_output": job.last_text_output,
+        "last_tool_name": job.last_tool_name,
+        "last_tool_event": dict(job.last_tool_event) if job.last_tool_event else None,
+        "last_step_reason": job.last_step_reason,
+        "last_step_status": job.last_step_status,
+        "last_session_id": job.last_session_id,
+        "diagnostic_phase": diagnostic_phase,
+        "diagnostic_note": diagnostic_note,
+    }
+
+
+def empty_event_diagnostics(note: str, phase: str = "no_event_seen") -> dict:
+    return {
+        "last_event_type": None,
+        "last_event_at": None,
+        "last_event_summary": None,
+        "recent_events": [],
+        "recent_event_count": 0,
+        "last_text_output": None,
+        "last_tool_name": None,
+        "last_tool_event": None,
+        "last_step_reason": None,
+        "last_step_status": None,
+        "last_session_id": None,
+        "diagnostic_phase": phase,
+        "diagnostic_note": note,
+    }
+
+
 def job_to_result(
     job: OpenCodeJob,
     *,
@@ -1852,8 +2305,11 @@ def job_to_result(
     summary_override: str | None = None,
     stdout_cursor: int | None = None,
     stderr_cursor: int | None = None,
-    include_tail: bool = True,
-    include_output: bool = True,
+    include_tail: bool = False,
+    include_output: bool = False,
+    include_delta: bool = False,
+    recent_events_limit: int = DEFAULT_RECENT_EVENTS_LIMIT,
+    delta_max_chars: int | None = None,
     tail_max_chars: int | None = None,
 ) -> dict:
     if is_job_active(job):
@@ -1865,15 +2321,24 @@ def job_to_result(
         full_stderr_tail = tail_to_text(job.stderr_tail, effective_tail_max_chars)
         stdout_tail = full_stdout_tail if include_tail else ""
         stderr_tail = full_stderr_tail if include_tail else ""
-        stdout_delta, current_stdout_cursor, stdout_delta_truncated = output_delta_locked(
+        stdout_delta_raw, current_stdout_cursor, stdout_delta_truncated = output_delta_locked(
             job,
             "stdout",
             stdout_cursor,
         )
-        stderr_delta, current_stderr_cursor, stderr_delta_truncated = output_delta_locked(
+        stderr_delta_raw, current_stderr_cursor, stderr_delta_truncated = output_delta_locked(
             job,
             "stderr",
             stderr_cursor,
+        )
+        effective_delta_max_chars = clamp_delta_max_chars(delta_max_chars)
+        stdout_delta, stdout_delta_response_truncated = truncate_delta_for_response(
+            stdout_delta_raw if include_delta else "",
+            effective_delta_max_chars,
+        )
+        stderr_delta, stderr_delta_response_truncated = truncate_delta_for_response(
+            stderr_delta_raw if include_delta else "",
+            effective_delta_max_chars,
         )
         process_running = job.process is not None and job.process.poll() is None
         output = ""
@@ -1894,7 +2359,29 @@ def job_to_result(
             runtime_seconds=runtime_seconds,
             idle_seconds=idle_seconds,
         )
+        event_diagnostics = build_event_diagnostics_locked(
+            job,
+            status=status,
+            process_running=process_running,
+            stall_diagnostics=stall_diagnostics,
+            recent_events_limit=recent_events_limit,
+        )
         change_risk_fields = build_change_risk_fields(job, status)
+        no_event_noop_diagnostics = build_no_event_noop_diagnostics(
+            job,
+            status=status,
+            stdout_tail=full_stdout_tail,
+            stderr_tail=full_stderr_tail,
+            stdout_delta=stdout_delta_raw,
+            stderr_delta=stderr_delta_raw,
+        )
+        suggested_action = stall_diagnostics["suggested_action"]
+        review_required = change_risk_fields["review_required"]
+        diagnostic_note = event_diagnostics["diagnostic_note"]
+        if no_event_noop_diagnostics["no_event_noop_risk"]:
+            suggested_action = "check_session_or_retry_without_session"
+            review_required = True
+            diagnostic_note = build_no_event_noop_note()
         validation_note = build_validation_note(status)
         summary = summary_override or job.summary
         if not summary:
@@ -1909,6 +2396,7 @@ def job_to_result(
                 summary = "OpenCode failed."
             elif status == "cancelled":
                 summary = "OpenCode job was cancelled by request."
+        work_summary_text = event_diagnostics["last_text_output"]
 
         return {
             "job_id": job.job_id,
@@ -1942,6 +2430,8 @@ def job_to_result(
             "stderr_cursor": current_stderr_cursor,
             "stdout_delta_truncated": stdout_delta_truncated,
             "stderr_delta_truncated": stderr_delta_truncated,
+            "stdout_delta_response_truncated": stdout_delta_response_truncated,
+            "stderr_delta_response_truncated": stderr_delta_response_truncated,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "first_output_at": job.first_output_at,
@@ -1949,10 +2439,27 @@ def job_to_result(
             "last_activity_at": job.last_activity_at,
             "runtime_seconds": runtime_seconds,
             "idle_seconds": idle_seconds,
+            "last_event_type": event_diagnostics["last_event_type"],
+            "last_event_at": event_diagnostics["last_event_at"],
+            "last_event_summary": event_diagnostics["last_event_summary"],
+            "recent_events": event_diagnostics["recent_events"],
+            "recent_event_count": event_diagnostics["recent_event_count"],
+            "last_text_output": event_diagnostics["last_text_output"],
+            "work_summary_text": work_summary_text,
+            "assistant_last_text": work_summary_text,
+            "last_tool_name": event_diagnostics["last_tool_name"],
+            "last_tool_event": event_diagnostics["last_tool_event"],
+            "last_step_reason": event_diagnostics["last_step_reason"],
+            "last_step_status": event_diagnostics["last_step_status"],
+            "last_session_id": event_diagnostics["last_session_id"],
+            "diagnostic_phase": event_diagnostics["diagnostic_phase"],
+            "diagnostic_note": diagnostic_note,
+            "no_event_noop_risk": no_event_noop_diagnostics["no_event_noop_risk"],
+            "no_event_noop_reason": no_event_noop_diagnostics["no_event_noop_reason"],
             "is_stalled": stall_diagnostics["is_stalled"],
             "stall_reason": stall_diagnostics["stall_reason"],
-            "suggested_action": stall_diagnostics["suggested_action"],
-            "review_required": change_risk_fields["review_required"],
+            "suggested_action": suggested_action,
+            "review_required": review_required,
             "incomplete_changes_risk": change_risk_fields["incomplete_changes_risk"],
             "potential_incomplete_changes_risk": stall_diagnostics["potential_incomplete_changes_risk"],
             "preexisting_dirty_warning": change_risk_fields["preexisting_dirty_warning"],
@@ -1980,6 +2487,9 @@ def job_to_result(
 
 
 def make_job_not_found_result(job_id: str) -> dict:
+    event_diagnostics = empty_event_diagnostics(
+        "Job id was not found; no OpenCode stdout JSON events are available."
+    )
     return {
         "job_id": job_id,
         "status": "not_found",
@@ -2015,6 +2525,8 @@ def make_job_not_found_result(job_id: str) -> dict:
         "stderr_cursor": 0,
         "stdout_delta_truncated": False,
         "stderr_delta_truncated": False,
+        "stdout_delta_response_truncated": False,
+        "stderr_delta_response_truncated": False,
         "started_at": None,
         "finished_at": None,
         "first_output_at": None,
@@ -2022,6 +2534,23 @@ def make_job_not_found_result(job_id: str) -> dict:
         "last_activity_at": None,
         "runtime_seconds": None,
         "idle_seconds": None,
+        "last_event_type": event_diagnostics["last_event_type"],
+        "last_event_at": event_diagnostics["last_event_at"],
+        "last_event_summary": event_diagnostics["last_event_summary"],
+        "recent_events": event_diagnostics["recent_events"],
+        "recent_event_count": event_diagnostics["recent_event_count"],
+        "last_text_output": event_diagnostics["last_text_output"],
+        "work_summary_text": None,
+        "assistant_last_text": None,
+        "last_tool_name": event_diagnostics["last_tool_name"],
+        "last_tool_event": event_diagnostics["last_tool_event"],
+        "last_step_reason": event_diagnostics["last_step_reason"],
+        "last_step_status": event_diagnostics["last_step_status"],
+        "last_session_id": event_diagnostics["last_session_id"],
+        "diagnostic_phase": event_diagnostics["diagnostic_phase"],
+        "diagnostic_note": event_diagnostics["diagnostic_note"],
+        "no_event_noop_risk": False,
+        "no_event_noop_reason": None,
         "is_stalled": False,
         "stall_reason": None,
         "suggested_action": "check_job_id",
@@ -2067,6 +2596,8 @@ def make_start_failed_result(
     server_id: str | None,
     server_url: str | None,
     session_id: str | None,
+    continue_last: bool = False,
+    fork_session: bool = False,
     attached_to_server: bool,
     error: str,
     server_recovered_from_registry: bool = False,
@@ -2086,6 +2617,9 @@ def make_start_failed_result(
         server_id=server_id,
         server_url=server_url,
         session_id=session_id,
+        requested_session_id=session_id,
+        continue_last=continue_last,
+        fork_session=fork_session,
         attached_to_server=attached_to_server,
         server_recovered_from_registry=server_recovered_from_registry,
         status="failed",
@@ -2149,6 +2683,8 @@ def start_job(
                 server_id=server_id,
                 server_url=None,
                 session_id=session_id,
+                continue_last=continue_last,
+                fork_session=fork_session,
                 attached_to_server=False,
                 error=error,
             )
@@ -2181,6 +2717,8 @@ def start_job(
                 server_id=server_id,
                 server_url=server.url,
                 session_id=session_id,
+                continue_last=continue_last,
+                fork_session=fork_session,
                 attached_to_server=True,
                 error=f"server_id is not running: {server_id}",
                 server_recovered_from_registry=server.recovered_from_registry,
@@ -2216,6 +2754,8 @@ def start_job(
             server_id=server_id,
             server_url=server_url,
             session_id=session_id,
+            continue_last=continue_last,
+            fork_session=fork_session,
             attached_to_server=attached_to_server,
             server_recovered_from_registry=server_recovered_from_registry,
             error=f"working_dir does not exist or is not a directory: {resolved_working_dir}",
@@ -2252,6 +2792,9 @@ def start_job(
             server_id=server_id,
             server_url=server_url,
             session_id=session_id,
+            requested_session_id=session_id,
+            continue_last=continue_last,
+            fork_session=fork_session,
             attached_to_server=attached_to_server,
             server_recovered_from_registry=server_recovered_from_registry,
             summary="OpenCode process is starting.",
@@ -2546,6 +3089,12 @@ def opencode_coder(
     continue_last: bool = False,
     fork_session: bool = False,
     title: str | None = None,
+    include_tail: bool = False,
+    include_output: bool = False,
+    include_delta: bool = False,
+    recent_events_limit: int = DEFAULT_RECENT_EVENTS_LIMIT,
+    delta_max_chars: int | None = None,
+    tail_max_chars: int | None = None,
 ) -> dict:
     """调用 OpenCode 在指定项目目录里编写或修改代码，并返回可查询的结构化 job 结果。"""
     job, early_result = start_job(
@@ -2563,12 +3112,33 @@ def opencode_coder(
         title,
     )
     if early_result is not None:
+        if job is not None:
+            return job_to_result(
+                job,
+                lock_rejected=bool(early_result.get("lock_rejected")),
+                new_job_started=bool(early_result.get("new_job_started")),
+                summary_override=early_result.get("summary"),
+                include_tail=bool(include_tail),
+                include_output=bool(include_output),
+                include_delta=bool(include_delta),
+                recent_events_limit=clamp_recent_events_limit(recent_events_limit),
+                delta_max_chars=clamp_delta_max_chars(delta_max_chars),
+                tail_max_chars=clamp_tail_max_chars(tail_max_chars),
+            )
         return early_result
     if job is None:
         raise RuntimeError("opencode_coder internal error: no job and no result")
 
     wait_for_job_policy(job, job.wait_policy, job.effective_timeout_seconds)
-    return job_to_result(job)
+    return job_to_result(
+        job,
+        include_tail=bool(include_tail),
+        include_output=bool(include_output),
+        include_delta=bool(include_delta),
+        recent_events_limit=clamp_recent_events_limit(recent_events_limit),
+        delta_max_chars=clamp_delta_max_chars(delta_max_chars),
+        tail_max_chars=clamp_tail_max_chars(tail_max_chars),
+    )
 
 
 @mcp.tool()
@@ -2631,6 +3201,9 @@ def opencode_coder_status(
     stderr_cursor: int | None = None,
     include_tail: bool = False,
     include_output: bool = False,
+    include_delta: bool = False,
+    recent_events_limit: int = DEFAULT_RECENT_EVENTS_LIMIT,
+    delta_max_chars: int | None = None,
     tail_max_chars: int | None = None,
 ) -> dict:
     """通过 job_id 查询 opencode_coder 后台任务状态；默认返回 compact 结果。"""
@@ -2652,6 +3225,9 @@ def opencode_coder_status(
         stderr_cursor=stderr_cursor,
         include_tail=bool(include_tail),
         include_output=bool(include_output),
+        include_delta=bool(include_delta),
+        recent_events_limit=clamp_recent_events_limit(recent_events_limit),
+        delta_max_chars=clamp_delta_max_chars(delta_max_chars),
         tail_max_chars=clamp_tail_max_chars(tail_max_chars, default=DEFAULT_STATUS_TAIL_MAX_CHARS),
     )
 

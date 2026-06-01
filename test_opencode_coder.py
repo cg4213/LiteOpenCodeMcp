@@ -48,6 +48,8 @@ def fake_command(
             "time.sleep(0.4)\n"
             "print('done', flush=True)\n"
         )
+    elif prompt == "no_output_success":
+        code = ""
     elif prompt == "delayed_output":
         code = (
             "import time\n"
@@ -71,6 +73,76 @@ def fake_command(
         code = "print('abcdefghijklmnopqrstuvwxyz', flush=True)"
     elif prompt == "session_json":
         code = "print('{\"sessionID\":\"ses_test_123\"}', flush=True)"
+    elif prompt == "opencode_events":
+        events = [
+            {
+                "type": "message.part.updated",
+                "timestamp": "2026-06-01T00:00:01Z",
+                "sessionID": "ses_evt_123",
+                "messageID": "msg_1",
+                "part": {"type": "text", "text": "Working on it"},
+            },
+            {
+                "type": "message.part.updated",
+                "timestamp": "2026-06-01T00:00:02Z",
+                "sessionID": "ses_evt_123",
+                "messageID": "msg_1",
+                "part": {"type": "tool", "name": "edit", "status": "started"},
+            },
+            {
+                "type": "step",
+                "timestamp": "2026-06-01T00:00:03Z",
+                "sessionID": "ses_evt_123",
+                "messageID": "msg_1",
+                "status": "finished",
+                "reason": "stop",
+            },
+        ]
+        code = (
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+        )
+    elif prompt == "many_opencode_events":
+        code = (
+            "import json\n"
+            f"limit = {server.RECENT_EVENT_LIMIT + 5!r}\n"
+            "for index in range(limit):\n"
+            "    print(json.dumps({\n"
+            "        'type': 'message.part.updated',\n"
+            "        'sessionID': 'ses_many',\n"
+            "        'messageID': f'msg_{index}',\n"
+            "        'part': {'type': 'text', 'text': f'event {index}'},\n"
+            "    }), flush=True)\n"
+        )
+    elif prompt == "large_json_text":
+        large_text = ("x" * 1000) + "FULL_TEXT_SENTINEL"
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_large",
+            "messageID": "msg_large",
+            "part": {"type": "text", "text": large_text},
+        }
+        code = (
+            "import json\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+        )
+    elif prompt == "json_event_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_sleep",
+            "messageID": "msg_sleep",
+            "part": {"type": "text", "text": "Waiting after text"},
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
     elif prompt == "long":
         code = (
             "import time\n"
@@ -117,6 +189,14 @@ def fake_command(
             "path.parent.mkdir(parents=True, exist_ok=True)\n"
             "path.write_text('generated\\n', encoding='utf-8')\n"
             "print(f'wrote {path}', flush=True)\n"
+        )
+    elif prompt.startswith("write_silent:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('generated\\n', encoding='utf-8')\n"
         )
     elif prompt.startswith("delete:"):
         path = prompt.split(":", 1)[1]
@@ -361,7 +441,14 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["success"])
         self.assertEqual(result["exit_code"], 0)
-        self.assertIn("ok", result["stdout_tail"])
+        self.assertEqual(result["stdout_tail"], "")
+        self.assertEqual(result["stderr_tail"], "")
+        self.assertEqual(result["stdout_delta"], "")
+        self.assertEqual(result["stderr_delta"], "")
+        self.assertEqual(result["output"], "")
+        self.assertGreater(result["stdout_cursor"], 0)
+        self.assertFalse(result["stdout_delta_response_truncated"])
+        self.assertFalse(result["stderr_delta_response_truncated"])
         self.assertFalse(result["is_stalled"])
         self.assertIsNone(result["stall_reason"])
         self.assertGreaterEqual(result["runtime_seconds"], 0)
@@ -381,10 +468,31 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIsNone(result["server_url"])
         self.assertIsNone(FAKE_BUILD_CALLS[-1]["server_url"])
 
+    def test_coder_include_tail_and_output_returns_debug_fields(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "short",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                include_tail=True,
+                include_output=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("ok", result["stdout_tail"])
+        self.assertEqual(result["stderr_tail"], "")
+        self.assertIn("ok", result["output"])
+        self.assertEqual(result["stdout_delta"], "")
+
     def test_default_completion_wait_policy_keeps_old_behavior(self):
         with tempfile.TemporaryDirectory() as working_dir:
             started_at = time.monotonic()
-            result = server.opencode_coder("delayed_output", working_dir=working_dir, timeout_seconds=2)
+            result = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                include_tail=True,
+            )
             elapsed = time.monotonic() - started_at
 
         self.assertEqual(result["status"], "completed")
@@ -421,6 +529,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 working_dir=working_dir,
                 timeout_seconds=2,
                 wait_policy="first_output",
+                include_tail=True,
             )
             elapsed = time.monotonic() - started_at
             final_status = wait_for_terminal_job(result["job_id"])
@@ -508,6 +617,14 @@ class OpenCodeCoderTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.2)
         self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["recent_events"], [])
+        self.assertEqual(result["recent_event_count"], 0)
+        self.assertIsNone(result["last_event_type"])
+        self.assertIsNone(result["last_text_output"])
+        self.assertEqual(result["diagnostic_phase"], "no_event_seen")
+        self.assertIn("not found", result["diagnostic_note"])
+        self.assertFalse(result["no_event_noop_risk"])
+        self.assertIsNone(result["no_event_noop_reason"])
 
     def test_status_returns_output_cursors(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -522,6 +639,29 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(status["stderr_tail"], "")
         self.assertEqual(status["output"], "")
 
+    def test_status_default_omits_delta_even_with_cursor_but_advances_cursor(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(
+                initial["job_id"],
+                wait_seconds=2,
+                stdout_cursor=initial["stdout_cursor"],
+            )
+            final_status = wait_for_terminal_job(initial["job_id"])
+
+        self.assertEqual(status["stdout_delta"], "")
+        self.assertEqual(status["stderr_delta"], "")
+        self.assertEqual(status["stdout_tail"], "")
+        self.assertEqual(status["output"], "")
+        self.assertGreater(status["stdout_cursor"], initial["stdout_cursor"])
+        self.assertFalse(status["stdout_delta_response_truncated"])
+        self.assertEqual(final_status["status"], "completed")
+
     def test_status_stdout_delta_from_previous_cursor(self):
         with tempfile.TemporaryDirectory() as working_dir:
             initial = server.opencode_coder(
@@ -534,6 +674,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 initial["job_id"],
                 wait_seconds=2,
                 stdout_cursor=initial["stdout_cursor"],
+                include_delta=True,
             )
             final_status = wait_for_terminal_job(initial["job_id"])
 
@@ -556,6 +697,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 initial["job_id"],
                 wait_seconds=0.7,
                 stdout_cursor=0,
+                include_delta=True,
             )
             elapsed = time.monotonic() - started_at
             final_status = wait_for_terminal_job(initial["job_id"])
@@ -577,6 +719,7 @@ class OpenCodeCoderTests(unittest.TestCase):
                 initial["job_id"],
                 wait_seconds=2,
                 stderr_cursor=initial["stderr_cursor"],
+                include_delta=True,
             )
             final_status = wait_for_terminal_job(initial["job_id"])
 
@@ -613,8 +756,17 @@ class OpenCodeCoderTests(unittest.TestCase):
     def test_status_invalid_or_out_of_range_cursor_is_safe(self):
         with tempfile.TemporaryDirectory() as working_dir:
             completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
-            invalid = server.opencode_coder_status(completed["job_id"], stdout_cursor="bad", stderr_cursor=-5)
-            too_large = server.opencode_coder_status(completed["job_id"], stdout_cursor=999999)
+            invalid = server.opencode_coder_status(
+                completed["job_id"],
+                stdout_cursor="bad",
+                stderr_cursor=-5,
+                include_delta=True,
+            )
+            too_large = server.opencode_coder_status(
+                completed["job_id"],
+                stdout_cursor=999999,
+                include_delta=True,
+            )
 
         self.assertIn("ok", invalid["stdout_delta"])
         self.assertEqual(invalid["stderr_delta"], "")
@@ -627,13 +779,35 @@ class OpenCodeCoderTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as working_dir:
                 completed = server.opencode_coder("large_stdout", working_dir=working_dir, timeout_seconds=2)
-                status = server.opencode_coder_status(completed["job_id"], stdout_cursor=0)
+                status = server.opencode_coder_status(completed["job_id"], stdout_cursor=0, include_delta=True)
         finally:
             server.MAX_DELTA_BUFFER_CHARS = previous_limit
 
         self.assertTrue(status["stdout_delta_truncated"])
         self.assertEqual(status["stdout_delta"], "tuvwxyz\n")
         self.assertEqual(status["stdout_cursor"], completed["stdout_cursor"])
+        self.assertFalse(status["stdout_delta_response_truncated"])
+
+    def test_status_delta_max_chars_truncates_response_and_advances_cursor(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("large_stdout", working_dir=working_dir, timeout_seconds=2)
+            status = server.opencode_coder_status(
+                completed["job_id"],
+                stdout_cursor=0,
+                include_delta=True,
+                delta_max_chars=6,
+            )
+            next_status = server.opencode_coder_status(
+                completed["job_id"],
+                stdout_cursor=status["stdout_cursor"],
+                include_delta=True,
+            )
+
+        self.assertEqual(status["stdout_delta"], "vwxyz\n")
+        self.assertFalse(status["stdout_delta_truncated"])
+        self.assertTrue(status["stdout_delta_response_truncated"])
+        self.assertEqual(status["stdout_cursor"], completed["stdout_cursor"])
+        self.assertEqual(next_status["stdout_delta"], "")
 
     def test_not_found_status_returns_cursor_and_delta_fields(self):
         result = server.opencode_coder_status("missing-job", stdout_cursor=123, stderr_cursor=456)
@@ -645,6 +819,8 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["stderr_delta"], "")
         self.assertFalse(result["stdout_delta_truncated"])
         self.assertFalse(result["stderr_delta_truncated"])
+        self.assertFalse(result["stdout_delta_response_truncated"])
+        self.assertFalse(result["stderr_delta_response_truncated"])
 
     def test_server_start_registers_running_server_and_status(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1041,6 +1217,177 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertTrue(FAKE_BUILD_CALLS[-1]["fork_session"])
         self.assertEqual(FAKE_BUILD_CALLS[-1]["title"], "Reuse Session")
 
+    def test_attached_session_no_event_no_change_no_output_reports_noop_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            try:
+                result = server.opencode_coder(
+                    "no_output_success",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    server_id=started["server_id"],
+                    session_id="ses_existing",
+                )
+                status = server.opencode_coder_status(result["job_id"])
+            finally:
+                server.opencode_server_stop(started["server_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["success"])
+        self.assertTrue(result["attached_to_server"])
+        self.assertEqual(result["recent_event_count"], 0)
+        self.assertEqual(result["new_changed_files"], [])
+        self.assertEqual(result["stdout_tail"], "")
+        self.assertEqual(result["stderr_tail"], "")
+        self.assertTrue(result["no_event_noop_risk"])
+        self.assertEqual(
+            result["no_event_noop_reason"],
+            "completed_attached_session_reuse_without_events_changes_or_output",
+        )
+        self.assertEqual(result["suggested_action"], "check_session_or_retry_without_session")
+        self.assertTrue(result["review_required"])
+        self.assertIn(
+            "completed with no stdout JSON events and no job-scoped changes",
+            result["diagnostic_note"],
+        )
+        self.assertIn("session reuse may have no-oped", result["diagnostic_note"])
+        self.assertTrue(status["no_event_noop_risk"])
+        self.assertEqual(status["suggested_action"], "check_session_or_retry_without_session")
+
+    def test_attached_session_json_event_without_changes_is_not_noop_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            try:
+                result = server.opencode_coder(
+                    "opencode_events",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    server_id=started["server_id"],
+                    session_id="ses_existing",
+                )
+            finally:
+                server.opencode_server_stop(started["server_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertGreater(result["recent_event_count"], 0)
+        self.assertEqual(result["new_changed_files"], [])
+        self.assertFalse(result["no_event_noop_risk"])
+        self.assertIsNone(result["no_event_noop_reason"])
+        self.assertEqual(result["suggested_action"], "review_result")
+        self.assertFalse(result["review_required"])
+
+    def test_attached_session_file_change_without_events_is_not_noop_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            try:
+                result = server.opencode_coder(
+                    "write_silent:src/changed.txt",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    server_id=started["server_id"],
+                    session_id="ses_existing",
+                )
+            finally:
+                server.opencode_server_stop(started["server_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["recent_event_count"], 0)
+        self.assertEqual(result["new_changed_files"], ["src/changed.txt"])
+        self.assertEqual(result["stdout_tail"], "")
+        self.assertFalse(result["no_event_noop_risk"])
+        self.assertIsNone(result["no_event_noop_reason"])
+        self.assertFalse(result["review_required"])
+
+    def test_direct_no_event_no_change_no_output_is_not_noop_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("no_output_success", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["attached_to_server"])
+        self.assertEqual(result["recent_event_count"], 0)
+        self.assertEqual(result["new_changed_files"], [])
+        self.assertFalse(result["no_event_noop_risk"])
+        self.assertIsNone(result["no_event_noop_reason"])
+        self.assertEqual(result["suggested_action"], "review_result")
+        self.assertFalse(result["review_required"])
+
+    def test_opencode_json_events_record_diagnostics_and_session_id(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("opencode_events", working_dir=working_dir, timeout_seconds=2)
+            status = server.opencode_coder_status(result["job_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["session_id"], "ses_evt_123")
+        self.assertEqual(result["last_session_id"], "ses_evt_123")
+        self.assertEqual(result["last_event_type"], "step")
+        self.assertEqual(result["last_event_at"], "2026-06-01T00:00:03Z")
+        self.assertEqual(result["recent_event_count"], 3)
+        self.assertEqual(len(result["recent_events"]), 3)
+        self.assertEqual(result["last_text_output"], "Working on it")
+        self.assertEqual(result["work_summary_text"], "Working on it")
+        self.assertEqual(result["assistant_last_text"], "Working on it")
+        self.assertEqual(result["last_tool_name"], "edit")
+        self.assertEqual(result["last_tool_event"]["part_type"], "tool")
+        self.assertEqual(result["last_step_status"], "finished")
+        self.assertEqual(result["last_step_reason"], "stop")
+        self.assertEqual(result["diagnostic_phase"], "process_finished")
+        self.assertIn("step_finished", result["diagnostic_note"])
+        self.assertEqual(status["recent_event_count"], 3)
+        self.assertEqual(status["last_event_summary"]["type"], "step")
+
+    def test_recent_opencode_events_keep_recent_limit(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("many_opencode_events", working_dir=working_dir, timeout_seconds=2)
+            verbose_status = server.opencode_coder_status(result["job_id"], recent_events_limit=20)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["recent_event_count"], server.RECENT_EVENT_LIMIT + 5)
+        self.assertEqual(len(result["recent_events"]), server.DEFAULT_RECENT_EVENTS_LIMIT)
+        self.assertEqual(result["recent_events"][0]["messageID"], "msg_20")
+        self.assertEqual(result["recent_events"][-1]["messageID"], "msg_24")
+        self.assertEqual(result["last_text_output"], "event 24")
+        self.assertEqual(result["work_summary_text"], "event 24")
+        self.assertEqual(len(verbose_status["recent_events"]), server.RECENT_EVENT_LIMIT)
+        self.assertEqual(verbose_status["recent_events"][0]["messageID"], "msg_5")
+        self.assertEqual(verbose_status["recent_events"][-1]["messageID"], "msg_24")
+
+    def test_large_text_event_is_stored_as_preview_only(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("large_json_text", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertLess(len(result["last_text_output"]), 400)
+        self.assertLess(len(result["recent_events"][0]["text_preview"]), 400)
+        self.assertNotIn("FULL_TEXT_SENTINEL", result["last_text_output"])
+        self.assertNotIn("FULL_TEXT_SENTINEL", result["work_summary_text"])
+        self.assertTrue(result["last_text_output"].endswith("...[truncated]"))
+
+    def test_non_json_stdout_keeps_output_and_empty_event_diagnostics(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "short",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                include_tail=True,
+            )
+            status = server.opencode_coder_status(
+                result["job_id"],
+                stdout_cursor=0,
+                include_tail=True,
+                include_delta=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("ok", result["stdout_tail"])
+        self.assertIn("ok", status["stdout_delta"])
+        self.assertEqual(result["recent_events"], [])
+        self.assertEqual(result["recent_event_count"], 0)
+        self.assertIsNone(result["last_event_type"])
+        self.assertIsNone(result["last_text_output"])
+        self.assertIsNone(result["work_summary_text"])
+        self.assertEqual(result["diagnostic_phase"], "process_finished")
+
     def test_missing_server_id_returns_structured_failure(self):
         with tempfile.TemporaryDirectory() as working_dir:
             result = server.opencode_coder(
@@ -1055,6 +1402,8 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["attached_to_server"])
         self.assertEqual(result["server_id"], "missing-server")
         self.assertIn("server_id not found", result["error"])
+        self.assertFalse(result["no_event_noop_risk"])
+        self.assertIsNone(result["no_event_noop_reason"])
 
     def test_long_task_times_out_and_can_be_queried_until_final_completion(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1216,6 +1565,34 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(status["suggested_action"], "consider_cancel")
         self.assertFalse(status["potential_incomplete_changes_risk"])
 
+    def test_stalled_job_reports_last_event_phase_in_diagnostic_note(self):
+        original_no_activity = server.STALL_NO_ACTIVITY_SECONDS
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_ACTIVITY_SECONDS = 0.1
+        server.STALL_NO_OUTPUT_SECONDS = 100.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "json_event_then_sleep",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="first_output",
+                )
+                time.sleep(0.15)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_NO_ACTIVITY_SECONDS = original_no_activity
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["diagnostic_phase"], "process_running_no_recent_event")
+        self.assertEqual(status["last_event_type"], "message.part.updated")
+        self.assertEqual(status["last_text_output"], "Waiting after text")
+        self.assertIn("stalled", status["diagnostic_note"])
+        self.assertIn("model_text", status["diagnostic_note"])
+
     def test_status_wait_seconds_recomputes_stall_after_wait(self):
         original_no_output = server.STALL_NO_OUTPUT_SECONDS
         server.STALL_NO_OUTPUT_SECONDS = 0.1
@@ -1267,7 +1644,12 @@ class OpenCodeCoderTests(unittest.TestCase):
 
     def test_failed_task_returns_structured_error(self):
         with tempfile.TemporaryDirectory() as working_dir:
-            result = server.opencode_coder("fail", working_dir=working_dir, timeout_seconds=2)
+            result = server.opencode_coder(
+                "fail",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                include_tail=True,
+            )
 
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["success"])

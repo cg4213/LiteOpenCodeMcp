@@ -151,6 +151,12 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `continue_last`：可选，传递 `--continue`。
 - `fork_session`：可选，传递 `--fork`。
 - `title`：可选，传递 `--title`。
+- `include_tail`：可选调试开关，默认 `false`，因此结果中的 `stdout_tail` / `stderr_tail` 为空。
+- `include_output`：可选兼容/调试开关，默认 `false`，因此旧字段 `output` 为空。
+- `include_delta`：可选调试开关，默认 `false`，因此即使传入 cursor 也不会返回原始 `stdout_delta` / `stderr_delta` 文本。
+- `recent_events_limit`：返回的 event 摘要数量上限，默认 `5`；调试时可传 `20` 获取完整保留窗口。
+- `delta_max_chars`：`include_delta=true` 时的 delta 响应字符上限，仅影响本次响应。
+- `tail_max_chars`：启用 tail/output 时的字符上限。
 
 `timeout_seconds` 会受到 `OPENCODE_CODER_MAX_WAIT_SECONDS` 限制，默认上限是 `110` 秒，避免 MCP 客户端先超时导致丢失 job 上下文。返回结果中会同时包含 `requested_timeout_seconds` 和 `effective_timeout_seconds`。
 
@@ -162,6 +168,12 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `"first_change"`：等到 `new_changed_files` 非空、进程完成或超时。
 
 长任务建议使用 `"start_only"` 或 `"first_output"`，让调用方尽快恢复控制权，再通过 `opencode_coder_status` 轮询。
+
+默认 `opencode_coder` 返回 compact 工作反馈：`status`、`success`、`suggested_action`、`summary`、`work_summary_text` / `last_text_output`、变更文件列表、风险字段、轻量诊断和 cursor 元数据。默认不返回 OpenCode 原始 stdout/stderr tail、stdout JSON event 流、delta 文本或旧字段 `output` 的大内容；需要调试时必须显式打开上面的参数。
+
+不建议跨不同 `working_dir` 或不同仓库根目录复用 `session_id`。如果 attached job 已经
+`completed` 但返回 `no_event_noop_risk=true`，不要把 `completed` / `success=true`
+当作正常完成；应检查 session 范围，或不传 `session_id` 重试，也可以新开 session/server。
 
 主要返回字段：
 
@@ -189,6 +201,23 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `stderr_tail`
 - `started_at`
 - `finished_at`
+- `last_event_type`
+- `last_event_at`
+- `last_event_summary`
+- `recent_events`
+- `recent_event_count`
+- `last_text_output`
+- `work_summary_text`
+- `assistant_last_text`
+- `last_tool_name`
+- `last_tool_event`
+- `last_step_reason`
+- `last_step_status`
+- `last_session_id`
+- `diagnostic_phase`
+- `diagnostic_note`
+- `no_event_noop_risk`
+- `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
 - `is_stalled`
@@ -215,11 +244,14 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `stderr_cursor`：可选，前一次结果返回的 stderr cursor。
 - `include_tail`：可选调试开关，默认 `false`，因此轮询不会反复返回 `stdout_tail` / `stderr_tail`。
 - `include_output`：可选兼容/调试开关，默认 `false`，因此轮询不会反复返回旧字段 `output`。
+- `include_delta`：可选调试开关，默认 `false`，因此 compact 轮询只推进 cursor，不返回原始 `stdout_delta` / `stderr_delta` 文本。
+- `recent_events_limit`：返回的 event 摘要数量上限，默认 `5`；调试时可传 `20` 获取完整保留窗口。
+- `delta_max_chars`：`include_delta=true` 时的 delta 响应字符上限，仅影响本次响应。
 - `tail_max_chars`：启用 tail/output 时的字符上限，会被包装层限制到安全范围内。
 
 当 `wait_seconds > 0` 时，status 会等待到以下任一情况发生：job 完成、新 stdout/stderr 到达、新文件变更被检测到、等待超时。status 查询不会启动新的 OpenCode 进程。
 
-默认 status 是 compact 响应：`stdout_tail`、`stderr_tail` 和 `output` 字段仍保留，但内容为空。如果传入 cursor，返回中会包含 `stdout_delta` / `stderr_delta`，只返回 cursor 之后的新增文本。cursor 是包装层内存缓冲区中的字符偏移，不是持久化日志文件偏移。只有调试输出时才建议传 `include_tail=true`，输出可能较大时同时传 `tail_max_chars`。
+默认 status 是 compact 响应：`stdout_tail`、`stderr_tail`、`output`、`stdout_delta` 和 `stderr_delta` 字段仍保留，但内容为空。cursor 仍会推进到当前最新偏移，方便调用方之后从“现在”开始调试轮询。需要返回 cursor 之后的文本时，显式传 `include_delta=true`。cursor 是包装层内存缓冲区中的字符偏移，不是持久化日志文件偏移；raw 字段只建议用于定向诊断。
 
 相关字段：
 
@@ -229,9 +261,28 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `stderr_cursor`
 - `stdout_delta_truncated`
 - `stderr_delta_truncated`
+- `stdout_delta_response_truncated`
+- `stderr_delta_response_truncated`
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
+- `last_event_type`
+- `last_event_at`
+- `last_event_summary`
+- `recent_events`
+- `recent_event_count`
+- `last_text_output`
+- `work_summary_text`
+- `assistant_last_text`
+- `last_tool_name`
+- `last_tool_event`
+- `last_step_reason`
+- `last_step_status`
+- `last_session_id`
+- `diagnostic_phase`
+- `diagnostic_note`
+- `no_event_noop_risk`
+- `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
 - `is_stalled`
@@ -258,18 +309,23 @@ next_status = opencode_coder_status(
     wait_seconds=5,
     stdout_cursor=stdout_cursor,
     stderr_cursor=stderr_cursor,
+    include_delta=True,
+    delta_max_chars=8000,
 )
 print(next_status["stdout_delta"])
 print(next_status["stderr_delta"])
 ```
 
-需要查看 tail 时显式开启：
+如果 cursor 早于内存 buffer 保留范围，wrapper 会返回当前仍可用的后缀，并设置 `stdout_delta_truncated` / `stderr_delta_truncated`。如果 `delta_max_chars` 截断了本次响应，会设置 `stdout_delta_response_truncated` / `stderr_delta_response_truncated`，同时 cursor 仍推进到最新位置，避免下一次重复吐出同一段大输出。普通轮询建议只消费 compact status 和 cursor；需要查看 raw 输出时显式开启：
 
 ```python
 debug_status = opencode_coder_status(
     job_id,
     include_tail=True,
     include_output=True,
+    include_delta=True,
+    recent_events_limit=20,
+    delta_max_chars=8000,
     tail_max_chars=4000,
 )
 ```
@@ -282,16 +338,35 @@ debug_status = opencode_coder_status(
 - `idle_seconds`：距离最近一次可信活动的秒数，活动时间按 `last_activity_at`、`first_output_at`、`started_at` 取最合理值。延迟首次观察到文件变更本身不会重置这个计时。
 - `is_stalled`：只对 active job 判断。为 `true` 表示超过 wrapper 的卡住阈值，但不等同于 failed。
 - `stall_reason`：可能是 `changed_files_no_recent_activity`、`no_output_no_change_after_start`、`no_recent_activity` 或 `timed_out_waiting_for_completion`。
-- `suggested_action`：给调用方的下一步建议，例如 `continue_polling`、`continue_polling_or_consider_cancel`、`consider_cancel`、`review_diff_then_consider_cancel`、`review_diff_or_git_status`。
+- `suggested_action`：给调用方的下一步建议，例如 `continue_polling`、`continue_polling_or_consider_cancel`、`consider_cancel`、`review_diff_then_consider_cancel`、`review_diff_or_git_status`、`check_session_or_retry_without_session`。
+
+wrapper 还会把 OpenCode 写到 stdout 的 JSON lines 解析成有界 event 诊断信息。这些字段只用于观察，不会改变执行策略：
+
+- `recent_events`：最近的 OpenCode stdout JSON event 摘要。结果默认最多返回 5 条；调试时可传 `recent_events_limit=20` 获取完整保留窗口。wrapper 不保存完整原始 event。
+- `recent_event_count`：本 job 观察到的 JSON event 总数；当超过上限后会大于 `len(recent_events)`。
+- `last_event_type`、`last_event_at`、`last_event_summary`：最后一个 event 的类型、时间戳和有界结构化摘要。
+- `last_text_output`：最近一次模型文本 event 的短 preview。
+- `work_summary_text` / `assistant_last_text`：最近一次 assistant 文本 preview 的别名；调用方理解 completed job 的工作反馈时应优先看这里，而不是 raw stdout。
+- `last_tool_name`、`last_tool_event`：最近一次观察到的工具活动。
+- `last_step_reason`、`last_step_status`：event 中出现的最近 step reason / status。
+- `last_session_id`：event JSON 中最近观察到的 `sessionID`。
+- `diagnostic_phase`：粗略阶段，例如 `no_event_seen`、`model_text`、`tool_activity`、`step_started`、`step_finished`、`process_running_no_recent_event`、`process_finished` 或 `unknown`。
+- `diagnostic_note`：面向调用方的短说明。stalled job 会结合 `is_stalled` / `stall_reason` 说明最后观察到的 event 阶段，但不会替代 `suggested_action`。
+- `no_event_noop_risk`：attached completed job 显式使用 session 复用参数（`session_id`、`continue_last` 或 `fork_session`）且没有 stdout JSON event、没有本 job 范围内的文件变更、也没有有效 stdout/stderr 输出时为 `true`。
+- `no_event_noop_reason`：`no_event_noop_risk=true` 时的机器可读原因。
+
+event 摘要只包含 `type`、`timestamp`、`sessionID`、`messageID`、`part_type`、`tool_name`、`text_preview`、`reason`、`status` 等小字段。`text_preview` 约 300 字符后截断并加标记。非 JSON stdout 行或 JSON 解析失败不会影响 job 执行，也不会影响原有 `stdout_tail` / `stdout_delta`。
 
 wrapper 不会因为这些字段自动 cancel、kill、回滚或清理文件。刚启动不久的 job 不应被标记为 stalled。`timed_out` 只表示本次 MCP 等待窗口结束但进程仍可能继续运行，应结合 `suggested_action`、`process_running` 和后续 status 决定继续轮询还是取消。
 
 半成品风险字段：
 
-- `review_required`：active、failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`；completed 但有 path policy violation 时也为 `true`。
+- `review_required`：active、failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`；completed 但有 path policy violation 或 `no_event_noop_risk=true` 时也为 `true`。
 - `incomplete_changes_risk`：failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`。
 - `potential_incomplete_changes_risk`：active 且 stalled 的 job 已经存在 `new_changed_files` 时为 `true`。这是运行中疑似半成品的提前提醒，不替代 failed、cancelled、timed_out 场景下的 `incomplete_changes_risk`。
 - `preexisting_dirty_warning`：任务开始前工作区已有 dirty 文件时非空，提醒 `all_changed_files` 不能简单归因给本 job。
+
+`no_event_noop_risk` 和 stalled 是两类问题：此时进程已经 completed，wrapper 不会 cancel、kill，也不会自动重跑。direct run 且没有 session 复用参数、completed 但有真实 stdout JSON event / 文本输出、或有 `new_changed_files` 的 job 不应被标记为 no-op 风险。一旦出现该字段，应优先不传 `session_id` 重试，或新开 session/server，而不是只因 `status=completed` 就接受结果。
 
 active job 如果长时间没有 stdout/stderr 且没有文件变更，也可以被标记为 stalled；但由于没有观察到本 job 的文件改动，不会设置 `potential_incomplete_changes_risk`。
 
@@ -351,7 +426,7 @@ opencode_coder_diff(job_id, max_chars=20000)
 
 `opencode_coder_diff` 是 review aid，不是唯一审查来源。当 `success=false`、`diff_empty_reason` 非空、`diff_command_errors` 非空或 `undiffed_files` 非空时，应回退到本地 `git status` / `git diff` 复核。
 
-diff 结果也会携带和 status 一致的 review 风险字段。如果 `review_required=true`、`incomplete_changes_risk=true` 或 `preexisting_dirty_warning` 非空，不应只看 diff 文本就接受结果；需要同时检查 job status 和本地 git 状态。
+diff 结果会携带文件变更相关的 review 风险字段，例如 `review_required`、`incomplete_changes_risk` 和 `preexisting_dirty_warning`。如果这些字段提示风险，不应只看 diff 文本就接受结果；需要同时检查 job status 和本地 git 状态。session no-op 风险以 job result/status 中的 `no_event_noop_risk` 为准；`opencode_coder_diff` 只审查本 job 范围内的文件变更。
 
 注意：这是 review 辅助，不保证是“只包含本 job 的纯 patch”。如果某个文件在 job 开始前已经 dirty，且本 job 又修改了它，git diff 可能混入任务前已有改动；此时返回 `includes_preexisting_dirty_changes=true`。
 
@@ -566,7 +641,7 @@ git -C <working_dir> -c core.quotepath=false status --porcelain=v1 --untracked-f
 - `output`
 - `return_code`
 
-新调用方建议优先使用 `status`、`exit_code`、`stdout_cursor` / `stderr_cursor` 和 delta 字段。轮询场景默认使用 compact status，避免重复传输完整 tail。只有需要调试时才传 `include_tail=true`；旧字段 `output` 也只有传 `include_output=true` 时才会在 status 中返回内容。
+新调用方建议优先使用 `status`、`exit_code`、`suggested_action`、`work_summary_text`、`new_changed_files`、风险字段和 `opencode_coder_diff`。轮询场景默认使用 compact status 和 cursor 元数据，避免重复传输完整 tail。`stdout_delta` / `stderr_delta` 与 `recent_events` 主要是调试诊断字段，不应作为普通调用链默认消费。只有需要调试时才传 `include_tail=true` 或 `include_delta=true`；旧字段 `output` 也只有传 `include_output=true` 时才会返回内容。
 
 ## 真实 OpenCode Smoke Test
 

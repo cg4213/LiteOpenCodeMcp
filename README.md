@@ -140,6 +140,17 @@ Parameters:
 - `continue_last`: optional flag to pass `--continue`.
 - `fork_session`: optional flag to pass `--fork`.
 - `title`: optional task title to pass with `--title`.
+- `include_tail`: optional debug flag. Defaults to `false`, so the result keeps
+  `stdout_tail` / `stderr_tail` empty.
+- `include_output`: optional compatibility/debug flag. Defaults to `false`, so the
+  legacy `output` field is empty.
+- `include_delta`: optional debug flag. Defaults to `false`, so `stdout_delta` /
+  `stderr_delta` stay empty even when cursors are provided.
+- `recent_events_limit`: maximum event summaries to return. Defaults to `5`; pass
+  `20` for the full retained diagnostic window.
+- `delta_max_chars`: optional response-only cap for returned deltas when
+  `include_delta=true`.
+- `tail_max_chars`: optional tail/output character cap when tail/output are enabled.
 
 `timeout_seconds` is capped by `OPENCODE_CODER_MAX_WAIT_SECONDS` to avoid the MCP
 client timing out before the wrapper can return job context. The default cap is
@@ -160,6 +171,12 @@ Wait policies:
 For long-running coding tasks, prefer `"start_only"` or `"first_output"` so the
 caller can regain control quickly and poll with `opencode_coder_status`.
 
+By default, `opencode_coder` returns compact work feedback: `status`, `success`,
+`suggested_action`, `summary`, `work_summary_text` / `last_text_output`,
+changed-file lists, risk fields, lightweight diagnostics, and cursor metadata. It
+does not return raw OpenCode stdout/stderr tails, stdout JSON event streams, delta
+text, or legacy `output` unless the caller explicitly enables the debug flags above.
+
 When `server_id` is omitted, `opencode_coder` keeps the original direct
 `opencode run` behavior. When `server_id` is provided, it runs through an attached
 headless server:
@@ -170,6 +187,11 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 
 The wrapper parses `sessionID` from JSON events written to stdout. If no valid JSON
 event has appeared yet, `session_id` can be `null`.
+
+Avoid reusing a `session_id` across different `working_dir` or repository roots. If
+a completed attached job reports `no_event_noop_risk=true`, do not treat
+`completed` / `success=true` as normal completion; check the session scope or retry
+without `session_id`, with a fresh session, or with a fresh server.
 
 Job results also include:
 
@@ -182,6 +204,23 @@ Job results also include:
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
+- `last_event_type`
+- `last_event_at`
+- `last_event_summary`
+- `recent_events`
+- `recent_event_count`
+- `last_text_output`
+- `work_summary_text`
+- `assistant_last_text`
+- `last_tool_name`
+- `last_tool_event`
+- `last_step_reason`
+- `last_step_status`
+- `last_session_id`
+- `diagnostic_phase`
+- `diagnostic_note`
+- `no_event_noop_risk`
+- `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
 - `is_stalled`
@@ -209,6 +248,12 @@ Parameters:
   not resend `stdout_tail` / `stderr_tail`.
 - `include_output`: optional compatibility/debug flag. Defaults to `false`, so
   compact polling does not resend legacy `output`.
+- `include_delta`: optional debug flag. Defaults to `false`, so compact polling
+  advances cursors without returning raw `stdout_delta` / `stderr_delta` text.
+- `recent_events_limit`: maximum event summaries to return. Defaults to `5`; pass
+  `20` for the full retained diagnostic window.
+- `delta_max_chars`: optional response-only cap for returned deltas when
+  `include_delta=true`.
 - `tail_max_chars`: optional tail/output character limit when either include flag is
   enabled. The wrapper clamps this to a safe upper bound.
 
@@ -216,12 +261,12 @@ When `wait_seconds` is greater than zero, status waits until the job completes, 
 stdout/stderr arrives, a new file change is detected, or the wait expires. Status
 queries never start a new OpenCode process.
 
-By default, status responses are compact: `stdout_tail`, `stderr_tail`, and `output`
-are present for compatibility but empty. When a cursor is provided, the response
-includes `stdout_delta` and/or `stderr_delta` with only the text after that cursor.
+By default, status responses are compact: `stdout_tail`, `stderr_tail`, `output`,
+`stdout_delta`, and `stderr_delta` are present for compatibility but empty. Cursors
+still advance to the latest observed offsets so callers can resume future debug
+polling from "now". Pass `include_delta=true` to return text after a supplied cursor.
 Cursors are character offsets inside a bounded in-memory buffer; they are not
-persistent log file offsets. Use `include_tail=true` only when debugging a job and
-cap it with `tail_max_chars` if the output may be large.
+persistent log file offsets. Use raw fields only for targeted diagnostics.
 
 Returns a structured result including:
 
@@ -257,11 +302,30 @@ Returns a structured result including:
 - `stderr_cursor`
 - `stdout_delta_truncated`
 - `stderr_delta_truncated`
+- `stdout_delta_response_truncated`
+- `stderr_delta_response_truncated`
 - `started_at`
 - `finished_at`
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
+- `last_event_type`
+- `last_event_at`
+- `last_event_summary`
+- `recent_events`
+- `recent_event_count`
+- `last_text_output`
+- `work_summary_text`
+- `assistant_last_text`
+- `last_tool_name`
+- `last_tool_event`
+- `last_step_reason`
+- `last_step_status`
+- `last_session_id`
+- `diagnostic_phase`
+- `diagnostic_note`
+- `no_event_noop_risk`
+- `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
 - `is_stalled`
@@ -295,6 +359,8 @@ next_status = opencode_coder_status(
     wait_seconds=5,
     stdout_cursor=stdout_cursor,
     stderr_cursor=stderr_cursor,
+    include_delta=True,
+    delta_max_chars=8000,
 )
 print(next_status["stdout_delta"])
 print(next_status["stderr_delta"])
@@ -302,15 +368,21 @@ print(next_status["stderr_delta"])
 
 Delta buffers are bounded by `MAX_DELTA_BUFFER_CHARS` inside the wrapper. If a cursor
 is older than the retained buffer, the wrapper returns the currently available suffix
-and sets `stdout_delta_truncated` or `stderr_delta_truncated` to `true`. Polling loops
-should use compact status plus cursor/delta fields; request tail fields only for
-targeted diagnostics:
+and sets `stdout_delta_truncated` or `stderr_delta_truncated` to `true`. If
+`delta_max_chars` trims the response, the wrapper sets
+`stdout_delta_response_truncated` or `stderr_delta_response_truncated` to `true` and
+still advances the cursor to the latest offset to avoid replaying the same large
+output. Normal polling loops should consume compact status and cursor fields; request
+delta/tail fields only for targeted diagnostics:
 
 ```python
 debug_status = opencode_coder_status(
     job_id,
     include_tail=True,
     include_output=True,
+    include_delta=True,
+    recent_events_limit=20,
+    delta_max_chars=8000,
     tail_max_chars=4000,
 )
 ```
@@ -331,7 +403,42 @@ Every job result includes lightweight diagnostics:
   `timed_out_waiting_for_completion` when applicable.
 - `suggested_action`: compact caller guidance such as `continue_polling`,
   `continue_polling_or_consider_cancel`, `consider_cancel`,
-  `review_diff_then_consider_cancel`, or `review_diff_or_git_status`.
+  `review_diff_then_consider_cancel`, `review_diff_or_git_status`, or
+  `check_session_or_retry_without_session`.
+
+The wrapper also parses stdout JSON lines from OpenCode into bounded event
+diagnostics. This is read-only observation; it does not change execution strategy:
+
+- `recent_events`: structured summaries of the most recent OpenCode stdout JSON
+  events. Results return at most 5 by default; pass `recent_events_limit=20` for the
+  full retained diagnostic window. The wrapper never stores the full raw event.
+- `recent_event_count`: total JSON events observed for this job, which may be larger
+  than `len(recent_events)` after truncation.
+- `last_event_type`, `last_event_at`, `last_event_summary`: the last observed event
+  type, event/observation timestamp, and bounded structured summary.
+- `last_text_output`: preview of the most recent model text event.
+- `work_summary_text` / `assistant_last_text`: aliases for the latest assistant text
+  preview; callers should prefer this over raw stdout for completed-job feedback.
+- `last_tool_name`, `last_tool_event`: the most recent observed tool activity.
+- `last_step_reason`, `last_step_status`: recent step-level reason/status when
+  present in OpenCode events.
+- `last_session_id`: the most recent `sessionID` observed in event JSON.
+- `diagnostic_phase`: a coarse derived phase such as `no_event_seen`, `model_text`,
+  `tool_activity`, `step_started`, `step_finished`,
+  `process_running_no_recent_event`, `process_finished`, or `unknown`.
+- `diagnostic_note`: short caller-facing explanation. For stalled jobs it includes
+  the last observed event phase alongside `is_stalled` / `stall_reason`, but it does
+  not replace `suggested_action`.
+- `no_event_noop_risk`: `true` when an attached completed job with explicit session
+  reuse (`session_id`, `continue_last`, or `fork_session`) produced no stdout JSON
+  events, no job-scoped changes, and no meaningful stdout/stderr output.
+- `no_event_noop_reason`: machine-readable reason when `no_event_noop_risk=true`.
+
+Event summaries include only small fields such as `type`, `timestamp`, `sessionID`,
+`messageID`, `part_type`, `tool_name`, `text_preview`, `reason`, and `status`.
+`text_preview` is capped at about 300 characters plus a truncation marker. Non-JSON
+stdout lines and JSON parse failures are ignored for event diagnostics and still flow
+through the normal `stdout_tail` / `stdout_delta` paths.
 
 The wrapper does not cancel, kill, revert, or clean files based on these fields.
 Freshly started jobs should remain `is_stalled=false`. `timed_out` means the MCP wait
@@ -341,7 +448,8 @@ window elapsed while the process continued; use `suggested_action`,
 Review-risk fields make non-atomic outcomes explicit:
 
 - `review_required`: `true` when an active, failed, cancelled, or timed-out job has
-  `new_changed_files`, or when a completed job has a path-policy violation.
+  `new_changed_files`, when a completed job has a path-policy violation, or when
+  `no_event_noop_risk=true`.
 - `incomplete_changes_risk`: `true` when a failed, cancelled, or timed-out job has
   `new_changed_files`.
 - `potential_incomplete_changes_risk`: `true` when an active stalled job already has
@@ -350,6 +458,13 @@ Review-risk fields make non-atomic outcomes explicit:
 - `preexisting_dirty_warning`: non-empty when the worktree already had dirty files
   before the job. In that case, `all_changed_files` cannot be attributed solely to
   this job.
+
+The no-event no-op risk is separate from stalled detection: the process has already
+completed, so the wrapper will not cancel, kill, or automatically rerun it. It is
+also not reported for direct runs without session reuse, completed jobs with real
+stdout JSON events or text output, or jobs with `new_changed_files`. When it is
+reported, callers should retry without `session_id` or start a fresh session/server
+instead of accepting the result solely because `status=completed`.
 
 An active job with no stdout/stderr and no file changes can still be marked stalled,
 but it does not set `potential_incomplete_changes_risk` because no job-scoped file
@@ -428,10 +543,12 @@ Treat `opencode_coder_diff` as a review aid. When `success=false`,
 `undiffed_files` is non-empty, fall back to local `git status` / `git diff` review
 before accepting the job result.
 
-The diff result also carries the same review-risk fields as status. If
-`review_required=true`, `incomplete_changes_risk=true`, or
-`preexisting_dirty_warning` is non-empty, do not rely on the diff text alone; inspect
-the job status and local git state before accepting the worktree.
+The diff result carries file-change review-risk fields such as
+`review_required`, `incomplete_changes_risk`, and `preexisting_dirty_warning`. If
+any of those fields indicate risk, do not rely on the diff text alone; inspect the
+job status and local git state before accepting the worktree. Session no-op risk is
+reported on the job result/status via `no_event_noop_risk`; `opencode_coder_diff`
+only reviews job-scoped file changes.
 
 If `working_dir` is not a git repository, or git status fails, the tool returns a
 structured error with `git_status_available=false`. Missing jobs return
@@ -710,11 +827,13 @@ The wrapper still returns legacy fields:
 - `return_code`
 
 New callers should prefer `status`, `exit_code`, `stdout_cursor` /
-`stderr_cursor`, and delta fields.
-For polling loops, prefer compact `opencode_coder_status` responses with
-`stdout_cursor` / `stderr_cursor` and delta fields. Tail fields are bounded by line
-and character limits, but status does not include them unless `include_tail=true`.
-Legacy `output` is also omitted from status unless `include_output=true`.
+`stderr_cursor`, `suggested_action`, `work_summary_text`, `new_changed_files`, risk
+fields, and `opencode_coder_diff`.
+For polling loops, prefer compact `opencode_coder_status` responses with cursor
+metadata. `stdout_delta` / `stderr_delta` and `recent_events` are debug diagnostics,
+not the normal calling contract. Tail fields are bounded by line and character
+limits, but neither tool includes them unless `include_tail=true`. Legacy `output`
+is also empty unless `include_output=true`.
 
 ## Integration Smoke Test
 
