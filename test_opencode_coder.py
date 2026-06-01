@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -241,9 +242,37 @@ def wait_for_terminal_job(job_id: str, total_wait_seconds: float = 3.0) -> dict:
     return status
 
 
+def read_test_registry() -> dict:
+    path = Path(server.get_server_registry_path())
+    if not path.exists():
+        return {"version": server.SERVER_REGISTRY_VERSION, "servers": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_test_registry(data: dict) -> None:
+    path = Path(server.get_server_registry_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def terminate_process(process) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        server.process_tree_kill(process, timeout_seconds=2)
+
+
 class OpenCodeCoderTests(unittest.TestCase):
     def setUp(self):
         FAKE_BUILD_CALLS.clear()
+        self.original_registry_path = os.environ.get(server.SERVER_REGISTRY_ENV_VAR)
+        self.registry_tempdir = tempfile.TemporaryDirectory()
+        os.environ[server.SERVER_REGISTRY_ENV_VAR] = str(
+            Path(self.registry_tempdir.name) / "opencode_coder_registry.json"
+        )
         server._reset_jobs_for_tests()
         server._reset_servers_for_tests()
         self.original_build_command = server.build_opencode_command
@@ -256,6 +285,11 @@ class OpenCodeCoderTests(unittest.TestCase):
         server.build_opencode_server_command = self.original_build_server_command
         server._reset_jobs_for_tests()
         server._reset_servers_for_tests()
+        if self.original_registry_path is None:
+            os.environ.pop(server.SERVER_REGISTRY_ENV_VAR, None)
+        else:
+            os.environ[server.SERVER_REGISTRY_ENV_VAR] = self.original_registry_path
+        self.registry_tempdir.cleanup()
 
     def test_short_task_completes_synchronously(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -549,6 +583,241 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIsNone(stopped["process_tree_kill_error"])
         self.assertEqual(status["status"], "stopped")
 
+    def test_server_start_writes_registry_record(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            try:
+                registry = read_test_registry()
+                record = registry["servers"][started["server_id"]]
+            finally:
+                server.opencode_server_stop(started["server_id"])
+
+        self.assertEqual(record["server_id"], started["server_id"])
+        self.assertEqual(record["url"], started["url"])
+        self.assertEqual(record["hostname"], started["hostname"])
+        self.assertEqual(record["port"], started["port"])
+        self.assertEqual(record["working_dir"], str(Path(working_dir).resolve(strict=False)))
+        self.assertEqual(record["pid"], started["pid"])
+        self.assertIn("command", record)
+        self.assertEqual(started["registry_path"], server.get_server_registry_path())
+        self.assertIsNone(started["registry_error"])
+
+    def test_server_stop_removes_registry_record(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            stopped = server.opencode_server_stop(started["server_id"])
+            registry = read_test_registry()
+
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertNotIn(started["server_id"], registry["servers"])
+
+    def test_server_status_recovers_running_server_from_registry(self):
+        process = None
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            process = server._SERVERS[started["server_id"]].process
+            with server._SERVER_REGISTRY_LOCK:
+                server._SERVERS.clear()
+
+            try:
+                status = server.opencode_server_status(started["server_id"])
+            finally:
+                terminate_process(process)
+                server.opencode_server_status(started["server_id"])
+                with server._SERVER_REGISTRY_LOCK:
+                    server._SERVERS.clear()
+
+        self.assertEqual(status["status"], "running")
+        self.assertTrue(status["success"])
+        self.assertTrue(status["process_running"])
+        self.assertTrue(status["recovered_from_registry"])
+        self.assertEqual(status["server_id"], started["server_id"])
+        self.assertEqual(status["url"], started["url"])
+        self.assertEqual(status["stdout_tail"], "")
+        self.assertEqual(status["stderr_tail"], "")
+
+    def test_recovered_server_can_be_used_for_attached_coder(self):
+        process = None
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            process = server._SERVERS[started["server_id"]].process
+            with server._SERVER_REGISTRY_LOCK:
+                server._SERVERS.clear()
+
+            try:
+                result = server.opencode_coder(
+                    "session_json",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    server_id=started["server_id"],
+                )
+            finally:
+                terminate_process(process)
+                server.opencode_server_status(started["server_id"])
+                with server._SERVER_REGISTRY_LOCK:
+                    server._SERVERS.clear()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["attached_to_server"])
+        self.assertTrue(result["server_recovered_from_registry"])
+        self.assertEqual(result["server_id"], started["server_id"])
+        self.assertEqual(result["server_url"], started["url"])
+        self.assertEqual(FAKE_BUILD_CALLS[-1]["server_url"], started["url"])
+
+    def test_recovered_server_stop_limitation_does_not_pollute_status(self):
+        process = None
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            process = server._SERVERS[started["server_id"]].process
+            with server._SERVER_REGISTRY_LOCK:
+                server._SERVERS.clear()
+
+            try:
+                stopped = server.opencode_server_stop(started["server_id"])
+                status = server.opencode_server_status(started["server_id"])
+            finally:
+                terminate_process(process)
+                server.opencode_server_status(started["server_id"])
+                with server._SERVER_REGISTRY_LOCK:
+                    server._SERVERS.clear()
+
+        self.assertEqual(stopped["status"], "running")
+        self.assertFalse(stopped["success"])
+        self.assertIn("will not blind-kill", stopped["error"])
+        self.assertEqual(status["status"], "running")
+        self.assertTrue(status["success"])
+        self.assertIsNone(status["error"])
+        self.assertTrue(status["recovered_from_registry"])
+
+    def test_server_list_includes_memory_server(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            try:
+                result = server.opencode_server_list()
+            finally:
+                server.opencode_server_stop(started["server_id"])
+
+        servers_by_id = {item["server_id"]: item for item in result["servers"]}
+        self.assertIn(started["server_id"], servers_by_id)
+        self.assertEqual(servers_by_id[started["server_id"]]["status"], "running")
+        self.assertTrue(servers_by_id[started["server_id"]]["process_running"])
+        self.assertEqual(result["registry_path"], server.get_server_registry_path())
+        self.assertGreaterEqual(result["count"], 1)
+
+    def test_server_list_recovers_server_from_registry(self):
+        process = None
+        with tempfile.TemporaryDirectory() as working_dir:
+            started = server.opencode_server_start(working_dir=working_dir, port=0)
+            process = server._SERVERS[started["server_id"]].process
+            with server._SERVER_REGISTRY_LOCK:
+                server._SERVERS.clear()
+
+            try:
+                result = server.opencode_server_list()
+            finally:
+                terminate_process(process)
+                server.opencode_server_status(started["server_id"])
+                with server._SERVER_REGISTRY_LOCK:
+                    server._SERVERS.clear()
+
+        servers_by_id = {item["server_id"]: item for item in result["servers"]}
+        self.assertIn(started["server_id"], servers_by_id)
+        self.assertTrue(servers_by_id[started["server_id"]]["recovered_from_registry"])
+        self.assertEqual(servers_by_id[started["server_id"]]["status"], "running")
+
+    def test_server_list_filters_by_working_dir(self):
+        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
+            first = server.opencode_server_start(working_dir=first_dir, port=0)
+            second = server.opencode_server_start(working_dir=second_dir, port=0)
+            try:
+                result = server.opencode_server_list(working_dir=str(Path(first_dir).resolve(strict=False)))
+            finally:
+                server.opencode_server_stop(first["server_id"])
+                server.opencode_server_stop(second["server_id"])
+
+        server_ids = {item["server_id"] for item in result["servers"]}
+        self.assertIn(first["server_id"], server_ids)
+        self.assertNotIn(second["server_id"], server_ids)
+
+    def test_server_list_handles_stale_registry_records(self):
+        stale_id = "stale-server-list"
+        stale_port = server.choose_free_port("127.0.0.1")
+        stale_record = {
+            "server_id": stale_id,
+            "url": f"http://127.0.0.1:{stale_port}",
+            "hostname": "127.0.0.1",
+            "port": stale_port,
+            "working_dir": str(Path.cwd()),
+            "pid": os.getpid(),
+            "started_at": "2026-01-01T00:00:00.000Z",
+            "command": ["opencode", "serve"],
+        }
+        write_test_registry({"version": server.SERVER_REGISTRY_VERSION, "servers": {stale_id: stale_record}})
+
+        hidden = server.opencode_server_list(include_lost=False)
+        hidden_registry = read_test_registry()
+        write_test_registry({"version": server.SERVER_REGISTRY_VERSION, "servers": {stale_id: stale_record}})
+        visible = server.opencode_server_list(include_lost=True)
+
+        self.assertEqual(hidden["servers"], [])
+        self.assertIn("registry_stale", hidden["registry_error"])
+        self.assertNotIn(stale_id, hidden_registry["servers"])
+        self.assertEqual(visible["count"], 1)
+        self.assertEqual(visible["servers"][0]["status"], "lost")
+        self.assertEqual(visible["servers"][0]["server_id"], stale_id)
+        self.assertIn("server_not_reachable", visible["servers"][0]["registry_error"])
+
+    def test_stale_registry_server_returns_lost_and_cleans_record(self):
+        stale_id = "stale-server"
+        stale_port = server.choose_free_port("127.0.0.1")
+        write_test_registry(
+            {
+                "version": server.SERVER_REGISTRY_VERSION,
+                "servers": {
+                    stale_id: {
+                        "server_id": stale_id,
+                        "url": f"http://127.0.0.1:{stale_port}",
+                        "hostname": "127.0.0.1",
+                        "port": stale_port,
+                        "working_dir": str(Path.cwd()),
+                        "pid": os.getpid(),
+                        "started_at": "2026-01-01T00:00:00.000Z",
+                        "command": ["opencode", "serve"],
+                    }
+                },
+            }
+        )
+
+        result = server.opencode_server_status(stale_id)
+        registry = read_test_registry()
+
+        self.assertEqual(result["status"], "lost")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "server_lost")
+        self.assertIn("server_not_reachable", result["registry_error"])
+        self.assertNotIn(stale_id, registry["servers"])
+
+    def test_corrupt_registry_file_does_not_crash_status(self):
+        Path(server.get_server_registry_path()).parent.mkdir(parents=True, exist_ok=True)
+        Path(server.get_server_registry_path()).write_text("{not-json", encoding="utf-8")
+
+        result = server.opencode_server_status("missing-server")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertFalse(result["success"])
+        self.assertIn("failed to read registry", result["registry_error"])
+
+    def test_job_status_is_not_restored_from_registry(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            with server._REGISTRY_LOCK:
+                server._JOBS.clear()
+                server._CWD_ACTIVE_JOBS.clear()
+            result = server.opencode_coder_status(completed["job_id"])
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["error"], "job_not_found")
+
     def test_process_tree_kill_helper_uses_platform_cleanup_path(self):
         class DummyProcess:
             pid = 4321
@@ -787,6 +1056,83 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertTrue(result["policy_violation"])
         self.assertEqual(result["forbidden_changed_files"], ["old.txt"])
         self.assertEqual(result["extra_changed_files"], [])
+
+    def test_coder_diff_missing_job_returns_not_found(self):
+        result = server.opencode_coder_diff("missing-job")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "job_not_found")
+        self.assertEqual(result["diff"], "")
+        self.assertEqual(result["undiffed_files"], [])
+
+    def test_coder_diff_returns_tracked_file_diff(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            tracked_file = Path(working_dir, "tracked.txt")
+            tracked_file.write_text("baseline\n", encoding="utf-8")
+            commit_all(working_dir)
+            job = server.opencode_coder("write:tracked.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertTrue(diff["success"])
+        self.assertEqual(diff["new_changed_files"], ["tracked.txt"])
+        self.assertFalse(diff["includes_preexisting_dirty_changes"])
+        self.assertEqual(diff["undiffed_files"], [])
+        self.assertIn("diff --git", diff["diff"])
+        self.assertIn("-baseline", diff["diff"])
+        self.assertIn("+generated", diff["diff"])
+
+    def test_coder_diff_returns_untracked_file_diff(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            job = server.opencode_coder("write:src/new.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertTrue(diff["success"])
+        self.assertEqual(diff["new_changed_files"], ["src/new.txt"])
+        self.assertEqual(diff["undiffed_files"], [])
+        self.assertIn("new file mode", diff["diff"])
+        self.assertIn("+++ b/src/new.txt", diff["diff"])
+        self.assertIn("+generated", diff["diff"])
+
+    def test_coder_diff_non_git_working_dir_returns_structured_error(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            job = server.opencode_coder("write:src/new.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertFalse(diff["success"])
+        self.assertFalse(diff["git_status_available"])
+        self.assertEqual(diff["diff"], "")
+        self.assertEqual(diff["undiffed_files"], [])
+        self.assertIsNotNone(diff["error"])
+
+    def test_coder_diff_truncates_large_response(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            job = server.opencode_coder("write:src/new.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"], max_chars=40)
+
+        self.assertTrue(diff["success"])
+        self.assertTrue(diff["diff_truncated"])
+        self.assertEqual(len(diff["diff"]), 40)
+        self.assertEqual(diff["max_chars"], 40)
+
+    def test_coder_diff_marks_preexisting_dirty_changes(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            old_file = Path(working_dir, "old.txt")
+            old_file.write_text("baseline\n", encoding="utf-8")
+            commit_all(working_dir)
+            old_file.write_text("preexisting dirty\n", encoding="utf-8")
+            job = server.opencode_coder("write:old.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertTrue(diff["success"])
+        self.assertEqual(diff["new_changed_files"], ["old.txt"])
+        self.assertEqual(diff["preexisting_changed_files"], ["old.txt"])
+        self.assertTrue(diff["includes_preexisting_dirty_changes"])
+        self.assertIn("+generated", diff["diff"])
 
     def test_allowed_paths_allows_in_scope_changes(self):
         with tempfile.TemporaryDirectory() as working_dir:

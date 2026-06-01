@@ -66,6 +66,7 @@ Job results also include:
 - `server_id`
 - `server_url`
 - `attached_to_server`
+- `server_recovered_from_registry`
 - `wait_policy`
 - `first_output_at`
 - `first_change_at`
@@ -163,6 +164,50 @@ and sets `stdout_delta_truncated` or `stderr_delta_truncated` to `true`. Use
 `stdout_tail` and `stderr_tail` for compatibility, and use cursor/delta polling to
 avoid repeatedly transferring the same tail text.
 
+### `opencode_coder_diff`
+
+Returns a bounded git diff for a known `opencode_coder` job:
+
+```text
+opencode_coder_diff(job_id, max_chars=20000)
+```
+
+Parameters:
+
+- `job_id`: job returned by `opencode_coder`.
+- `max_chars`: maximum characters returned in `diff`. The wrapper clamps this to a
+  safe upper bound.
+
+The diff is based on the job's `new_changed_files`. Tracked files use `git diff` and
+`git diff --cached`; untracked regular files are rendered as a `/dev/null` unified
+diff using a bounded in-memory read. The tool never writes temp files into the user
+project.
+
+Returned fields:
+
+- `job_id`
+- `status`
+- `working_dir`
+- `new_changed_files`
+- `preexisting_changed_files`
+- `diff`
+- `diff_truncated`
+- `max_chars`
+- `undiffed_files`
+- `includes_preexisting_dirty_changes`
+- `git_status_available`
+- `error`
+- `success`
+
+This is a review aid, not a guaranteed pure patch for only the current job. If a file
+was already dirty before the job and the job touched it again, the returned git diff
+may include earlier dirty changes too; in that case
+`includes_preexisting_dirty_changes=true`.
+
+If `working_dir` is not a git repository, or git status fails, the tool returns a
+structured error with `git_status_available=false`. Missing jobs return
+`status="not_found"` and `error="job_not_found"`.
+
 ### `opencode_coder_cancel`
 
 Cancels a running `opencode_coder` job by `job_id` and returns the same structured
@@ -230,16 +275,53 @@ The tool waits until the selected port accepts TCP connections, then returns:
 - `process_tree_kill_attempted`
 - `process_tree_kill_succeeded`
 - `process_tree_kill_error`
+- `recovered_from_registry`
+- `registry_path`
+- `registry_error`
 - `process_running`
 - `command`
 - `success`
 - `error`
 
-Server state is in memory only and is not written to the user project.
+Managed server metadata is persisted in a small wrapper registry outside the user
+project. See [Registry Persistence](#registry-persistence).
 
 ### `opencode_server_status`
 
-Returns the same server fields for a known `server_id`.
+Returns the same server fields for a known `server_id`. If the server is not present
+in memory, the wrapper tries to recover a managed server record from the registry
+before returning `not_found` or `lost`.
+
+### `opencode_server_list`
+
+Lists managed OpenCode servers visible to the wrapper:
+
+```text
+opencode_server_list(working_dir=None, include_lost=false)
+```
+
+Parameters:
+
+- `working_dir`: optional path filter. Relative and absolute paths are normalized the
+  same way as `opencode_coder`.
+- `include_lost`: when false, stale registry records are cleaned or reported through
+  the top-level `registry_error` but omitted from `servers`. When true, stale records
+  are included as `status="lost"` entries.
+
+The tool returns:
+
+- `servers`: list of server status objects using the same shape as
+  `opencode_server_status`.
+- `count`
+- `registry_path`
+- `registry_error`
+- `success`
+
+The list includes in-memory servers and registry records. Registry-only records are
+validated with the same pid + TCP check used by `opencode_server_status`; valid
+records are recovered into memory and can be used by `opencode_coder(server_id=...)`.
+The tool does not start servers automatically and does not scan system processes by
+`working_dir`.
 
 ### `opencode_server_stop`
 
@@ -250,6 +332,59 @@ does not exit in time, it attempts the same process-tree cleanup strategy used b
 launches the server in a new session and kills that process group as a fallback. For
 requested stops, `status` is the primary result field; the underlying process may
 return a non-zero `exit_code` even when the stop operation succeeds.
+
+If a server was recovered from the registry after an MCP server restart, the wrapper
+does not have its original `Popen` handle or stdout/stderr pipes. In that case status
+and attach can still work when validation passes, but `opencode_server_stop` returns a
+structured limitation instead of blindly killing a pid.
+
+## Registry Persistence
+
+The wrapper persists only managed OpenCode server metadata. Job records, stdout/stderr
+buffers, and process handles remain in memory. After an MCP server restart, historical
+`opencode_coder_status(old_job_id)` calls can still return `not_found`.
+
+Default registry path:
+
+- Windows: `%LOCALAPPDATA%\LiteOpenCodeMcp\opencode_coder_registry.json`
+- Windows fallback: `%TEMP%\LiteOpenCodeMcp\opencode_coder_registry.json`
+- Non-Windows: `$XDG_CACHE_HOME/LiteOpenCodeMcp/opencode_coder_registry.json`
+- Non-Windows fallback: `~/.cache/LiteOpenCodeMcp/opencode_coder_registry.json`
+
+Override with:
+
+```powershell
+$env:OPENCODE_CODER_REGISTRY_PATH = "D:\path\to\opencode_coder_registry.json"
+```
+
+The registry is JSON and is written with an atomic temporary-file replace. It stores
+only the managed server metadata needed to reattach:
+
+- `server_id`
+- `url`
+- `hostname`
+- `port`
+- `working_dir`
+- `pid`
+- `started_at`
+- `command`
+- `command_summary`
+
+Recovery happens lazily when `opencode_server_status(server_id)`,
+`opencode_server_stop(server_id)`, or `opencode_coder(..., server_id=...)` cannot find
+the server in memory. The wrapper verifies that the recorded pid still exists and that
+the server host/port accepts a TCP connection. If validation succeeds, the result has
+`recovered_from_registry=true`; attached jobs can then use the recovered `server_url`.
+
+Recovery limitations:
+
+- stdout/stderr tail and delta buffers are not recovered.
+- the original `Popen` process handle is not recovered.
+- failed pid/url validation returns `status="lost"` and removes the stale registry
+  record.
+- corrupt registry JSON is reported through `registry_error` and does not crash the
+  MCP tool.
+- the wrapper never scans system processes by `working_dir`.
 
 ## Git Snapshots
 
@@ -314,6 +449,8 @@ modify files.
 - `failed`: process could not start or finished with a non-zero exit code.
 - `cancelled`: cancellation was requested and the OpenCode process exited.
 - `not_found`: status query used an unknown or expired `job_id`.
+- `stopped`: managed server was stopped by request.
+- `lost`: a persisted managed server record existed, but pid/url validation failed.
 
 ## Compatibility
 
@@ -357,7 +494,8 @@ diagnosis.
 
 - Decide whether the real OpenCode integration smoke test should become a scheduled
   or CI-gated check.
-- Persistent server/job registry across MCP server restarts.
+- Full job recovery across MCP server restarts. Managed server registry MVP is
+  implemented, but job history and output pipes are still memory-only.
 - Stronger cross-platform process-tree cleanup verification with real child process
   trees.
 - More detailed test/validation extraction from OpenCode output.

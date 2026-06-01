@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import difflib
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -30,8 +32,12 @@ DEFAULT_FINISHED_JOB_TTL_SECONDS = 3600.0
 MAX_STATUS_WAIT_SECONDS = 30.0
 DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 MAX_FINISHED_JOBS = 100
+DEFAULT_DIFF_MAX_CHARS = 20_000
+MAX_DIFF_CHARS = 200_000
 ACTIVE_STATUSES = {"starting", "running", "timed_out"}
 VALID_WAIT_POLICIES = {"completion", "start_only", "first_output", "first_change"}
+SERVER_REGISTRY_VERSION = 1
+SERVER_REGISTRY_ENV_VAR = "OPENCODE_CODER_REGISTRY_PATH"
 
 _JOBS: dict[str, "OpenCodeJob"] = {}
 _CWD_ACTIVE_JOBS: dict[str, set[str]] = {}
@@ -65,6 +71,7 @@ class OpenCodeJob:
     server_url: str | None = None
     session_id: str | None = None
     attached_to_server: bool = False
+    server_recovered_from_registry: bool = False
     status: str = "starting"
     pid: int | None = None
     exit_code: int | None = None
@@ -130,6 +137,9 @@ class OpenCodeServer:
     process_tree_kill_attempted: bool = False
     process_tree_kill_succeeded: bool = False
     process_tree_kill_error: str | None = None
+    recovered_from_registry: bool = False
+    registry_path: str | None = None
+    registry_error: str | None = None
     done_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -317,6 +327,267 @@ def clamp_wait_seconds(wait_seconds: float | int | None) -> float:
     except (TypeError, ValueError):
         return 0.0
     return min(max(parsed, 0.0), MAX_STATUS_WAIT_SECONDS)
+
+
+def clamp_diff_max_chars(max_chars) -> int:
+    try:
+        parsed = int(max_chars)
+    except (TypeError, ValueError):
+        return DEFAULT_DIFF_MAX_CHARS
+    return min(max(parsed, 0), MAX_DIFF_CHARS)
+
+
+def get_server_registry_path() -> str:
+    override = os.environ.get(SERVER_REGISTRY_ENV_VAR)
+    if override:
+        return str(Path(override).expanduser().resolve(strict=False))
+
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or tempfile.gettempdir()
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return str(Path(base) / "LiteOpenCodeMcp" / "opencode_coder_registry.json")
+
+
+def empty_server_registry() -> dict:
+    return {
+        "version": SERVER_REGISTRY_VERSION,
+        "servers": {},
+    }
+
+
+def load_server_registry_unlocked() -> tuple[dict, str | None]:
+    registry_path = Path(get_server_registry_path())
+    if not registry_path.exists():
+        return empty_server_registry(), None
+
+    try:
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("registry root must be a JSON object")
+        servers = data.get("servers")
+        if not isinstance(servers, dict):
+            servers = {}
+        return {
+            "version": data.get("version", SERVER_REGISTRY_VERSION),
+            "servers": servers,
+        }, None
+    except Exception as exc:
+        return empty_server_registry(), f"failed to read registry {registry_path}: {exc}"
+
+
+def write_server_registry_unlocked(data: dict) -> str | None:
+    registry_path = Path(get_server_registry_path())
+    tmp_path = registry_path.with_name(f"{registry_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": SERVER_REGISTRY_VERSION,
+            "servers": data.get("servers", {}),
+        }
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, registry_path)
+        return None
+    except Exception as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return f"failed to write registry {registry_path}: {exc}"
+
+
+def server_to_registry_record(server: OpenCodeServer) -> dict:
+    with server.lock:
+        return {
+            "server_id": server.server_id,
+            "url": server.url,
+            "hostname": server.hostname,
+            "port": server.port,
+            "working_dir": server.working_dir,
+            "pid": server.pid,
+            "started_at": server.started_at,
+            "command": list(server.command),
+            "command_summary": " ".join(server.command),
+        }
+
+
+def persist_server_record(server: OpenCodeServer) -> None:
+    with _SERVER_REGISTRY_LOCK:
+        data, load_error = load_server_registry_unlocked()
+        data.setdefault("servers", {})[server.server_id] = server_to_registry_record(server)
+        write_error = write_server_registry_unlocked(data)
+        with server.lock:
+            server.registry_path = get_server_registry_path()
+            server.registry_error = write_error or load_error
+
+
+def remove_server_record_unlocked(server_id: str) -> str | None:
+    data, load_error = load_server_registry_unlocked()
+    servers = data.setdefault("servers", {})
+    servers.pop(server_id, None)
+    write_error = write_server_registry_unlocked(data)
+    return write_error or load_error
+
+
+def remove_server_record(server_id: str) -> str | None:
+    with _SERVER_REGISTRY_LOCK:
+        return remove_server_record_unlocked(server_id)
+
+
+def check_pid_alive(pid: int | None) -> tuple[bool, str | None]:
+    if pid is None or int(pid) <= 0:
+        return False, "pid_not_available"
+    pid = int(pid)
+    try:
+        if os.name == "nt":
+            completed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+            )
+            output = (completed.stdout or "") + (completed.stderr or "")
+            if completed.returncode != 0:
+                return False, f"tasklist exited with code {completed.returncode}: {output.strip()}"
+            if str(pid) not in output:
+                return False, "pid_not_alive"
+            return True, None
+
+        os.kill(pid, 0)
+        return True, None
+    except ProcessLookupError:
+        return False, "pid_not_alive"
+    except PermissionError:
+        return True, None
+    except Exception as exc:
+        return False, f"pid_check_failed: {exc}"
+
+
+def check_tcp_reachable(hostname: str, port: int, timeout_seconds: float = 0.5) -> tuple[bool, str | None]:
+    try:
+        with socket.create_connection((hostname, int(port)), timeout=timeout_seconds):
+            return True, None
+    except OSError as exc:
+        return False, f"server_not_reachable: {exc}"
+
+
+def validate_server_runtime(pid: int | None, hostname: str, port: int) -> tuple[bool, str | None]:
+    pid_ok, pid_error = check_pid_alive(pid)
+    if not pid_ok:
+        return False, pid_error
+    tcp_ok, tcp_error = check_tcp_reachable(hostname, port)
+    if not tcp_ok:
+        return False, tcp_error
+    return True, None
+
+
+def recover_server_from_registry(server_id: str) -> tuple[OpenCodeServer | None, str | None]:
+    with _SERVER_REGISTRY_LOCK:
+        existing = _SERVERS.get(server_id)
+        if existing is not None:
+            return existing, None
+
+        data, load_error = load_server_registry_unlocked()
+        if load_error:
+            return None, load_error
+
+        record = data.get("servers", {}).get(server_id)
+        if not isinstance(record, dict):
+            return None, None
+
+        try:
+            hostname = str(record["hostname"])
+            port = int(record["port"])
+            pid = int(record["pid"])
+            url = str(record.get("url") or f"http://{hostname}:{port}")
+            working_dir = str(record["working_dir"])
+            command = record.get("command")
+            if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+                command = []
+            started_at = str(record.get("started_at") or utc_now())
+        except Exception as exc:
+            remove_error = remove_server_record_unlocked(server_id)
+            detail = f"registry_stale: malformed server record: {exc}"
+            if remove_error:
+                detail = f"{detail}; cleanup_error: {remove_error}"
+            return None, detail
+
+        runtime_ok, runtime_error = validate_server_runtime(pid, hostname, port)
+        if not runtime_ok:
+            remove_error = remove_server_record_unlocked(server_id)
+            detail = f"registry_stale: {runtime_error}"
+            if remove_error:
+                detail = f"{detail}; cleanup_error: {remove_error}"
+            return None, detail
+
+        server = OpenCodeServer(
+            server_id=server_id,
+            url=url,
+            hostname=hostname,
+            port=port,
+            working_dir=working_dir,
+            command=command,
+            status="running",
+            pid=pid,
+            started_at=started_at,
+            recovered_from_registry=True,
+            registry_path=get_server_registry_path(),
+        )
+        _SERVERS[server_id] = server
+        return server, None
+
+
+def get_server_for_lookup(server_id: str) -> tuple[OpenCodeServer | None, str | None]:
+    with _SERVER_REGISTRY_LOCK:
+        server = _SERVERS.get(server_id)
+    if server is not None:
+        return server, None
+    return recover_server_from_registry(server_id)
+
+
+def working_dir_matches_filter(server_working_dir: str | None, working_dir_filter: str | None) -> bool:
+    if working_dir_filter is None:
+        return True
+    if server_working_dir is None:
+        return False
+    _resolved_filter, filter_key = normalize_working_dir(working_dir_filter)
+    _resolved_server, server_key = normalize_working_dir(server_working_dir)
+    return server_key == filter_key
+
+
+def make_server_lost_result(server_id: str, record: dict | None, registry_error: str | None) -> dict:
+    record = record if isinstance(record, dict) else {}
+    return {
+        "server_id": server_id,
+        "url": record.get("url"),
+        "hostname": record.get("hostname"),
+        "port": record.get("port"),
+        "working_dir": record.get("working_dir"),
+        "pid": record.get("pid"),
+        "status": "lost",
+        "exit_code": None,
+        "started_at": record.get("started_at"),
+        "finished_at": None,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "process_tree_kill_attempted": False,
+        "process_tree_kill_succeeded": False,
+        "process_tree_kill_error": None,
+        "recovered_from_registry": False,
+        "registry_path": get_server_registry_path(),
+        "registry_error": registry_error,
+        "process_running": False,
+        "command": " ".join(record.get("command", [])) if isinstance(record.get("command"), list) else record.get("command_summary"),
+        "success": False,
+        "error": "server_lost",
+    }
 
 
 def normalize_working_dir(working_dir: str) -> tuple[str, str]:
@@ -599,10 +870,51 @@ def choose_free_port(hostname: str) -> int:
 
 def is_server_running(server: OpenCodeServer) -> bool:
     with server.lock:
-        return server.process is not None and server.process.poll() is None
+        process = server.process
+        recovered_from_registry = server.recovered_from_registry
+        status = server.status
+        pid = server.pid
+        hostname = server.hostname
+        port = server.port
+    if process is not None:
+        return process.poll() is None
+    if recovered_from_registry and status == "running":
+        runtime_ok, runtime_error = validate_server_runtime(pid, hostname, port)
+        if runtime_ok:
+            return True
+        with server.lock:
+            server.status = "lost"
+            server.finished_at = utc_now()
+            server.error = f"Recovered server is no longer reachable: {runtime_error}"
+            server.registry_error = runtime_error
+            server.done_event.set()
+        remove_server_record(server.server_id)
+    return False
 
 
 def refresh_server_status(server: OpenCodeServer) -> None:
+    with server.lock:
+        process = server.process
+        recovered_from_registry = server.recovered_from_registry
+        status = server.status
+        pid = server.pid
+        hostname = server.hostname
+        port = server.port
+        if process is None and not recovered_from_registry:
+            return
+    if process is None and recovered_from_registry:
+        if status == "running":
+            runtime_ok, runtime_error = validate_server_runtime(pid, hostname, port)
+            if not runtime_ok:
+                remove_error = remove_server_record(server.server_id)
+                with server.lock:
+                    server.status = "lost"
+                    server.finished_at = utc_now()
+                    server.error = f"Recovered server is no longer reachable: {runtime_error}"
+                    server.registry_error = remove_error or runtime_error
+                    server.done_event.set()
+        return
+
     with server.lock:
         if server.process is None:
             return
@@ -625,7 +937,13 @@ def server_to_result(server: OpenCodeServer) -> dict:
     with server.lock:
         stdout_tail = tail_to_text(server.stdout_tail)
         stderr_tail = tail_to_text(server.stderr_tail)
-        process_running = server.process is not None and server.process.poll() is None
+        process_running = (
+            server.process is not None and server.process.poll() is None
+        ) or (
+            server.process is None
+            and server.recovered_from_registry
+            and server.status == "running"
+        )
         return {
             "server_id": server.server_id,
             "url": server.url,
@@ -642,6 +960,9 @@ def server_to_result(server: OpenCodeServer) -> dict:
             "process_tree_kill_attempted": server.process_tree_kill_attempted,
             "process_tree_kill_succeeded": server.process_tree_kill_succeeded,
             "process_tree_kill_error": server.process_tree_kill_error,
+            "recovered_from_registry": server.recovered_from_registry,
+            "registry_path": server.registry_path or get_server_registry_path(),
+            "registry_error": server.registry_error,
             "process_running": process_running,
             "command": " ".join(server.command),
             "success": server.status in {"running", "stopped"} and server.error is None,
@@ -675,6 +996,11 @@ def monitor_server(server: OpenCodeServer, reader_threads: list[threading.Thread
             server.status = "failed"
             server.error = f"opencode serve exited with code {exit_code}"
         server.done_event.set()
+    remove_error = remove_server_record(server.server_id)
+    if remove_error:
+        with server.lock:
+            server.registry_path = get_server_registry_path()
+            server.registry_error = remove_error
 
 
 def wait_for_server_port(server: OpenCodeServer, timeout_seconds: float = 15.0) -> bool:
@@ -693,7 +1019,13 @@ def wait_for_server_port(server: OpenCodeServer, timeout_seconds: float = 15.0) 
     return False
 
 
-def make_server_not_found_result(server_id: str) -> dict:
+def make_server_not_found_result(
+    server_id: str,
+    *,
+    status: str = "not_found",
+    error: str = "server_not_found",
+    registry_error: str | None = None,
+) -> dict:
     return {
         "server_id": server_id,
         "url": None,
@@ -701,7 +1033,7 @@ def make_server_not_found_result(server_id: str) -> dict:
         "port": None,
         "working_dir": None,
         "pid": None,
-        "status": "not_found",
+        "status": status,
         "exit_code": None,
         "started_at": None,
         "finished_at": None,
@@ -710,10 +1042,13 @@ def make_server_not_found_result(server_id: str) -> dict:
         "process_tree_kill_attempted": False,
         "process_tree_kill_succeeded": False,
         "process_tree_kill_error": None,
+        "recovered_from_registry": False,
+        "registry_path": get_server_registry_path(),
+        "registry_error": registry_error,
         "process_running": False,
         "command": None,
         "success": False,
-        "error": "server_not_found",
+        "error": error,
     }
 
 
@@ -804,6 +1139,100 @@ def collect_git_status(working_dir: str) -> GitStatusSnapshot:
         return GitStatusSnapshot(available=False, error=trim_tail(error))
 
     return build_git_status_snapshot(working_dir, result.stdout)
+
+
+def collect_git_status_entry_map(working_dir: str) -> tuple[dict[str, tuple[str, str]], str | None]:
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                working_dir,
+                "-c",
+                "core.quotepath=false",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except Exception as exc:
+        return {}, str(exc)
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "git status failed").strip()
+        return {}, trim_tail(error)
+
+    return parse_git_status_entries(result.stdout), None
+
+
+def run_git_diff(working_dir: str, paths: list[str], *, cached: bool = False) -> tuple[str, str | None]:
+    if not paths:
+        return "", None
+    command = [
+        "git",
+        "-C",
+        working_dir,
+        "-c",
+        "core.quotepath=false",
+        "diff",
+    ]
+    if cached:
+        command.append("--cached")
+    command.extend(["--", *paths])
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception as exc:
+        return "", str(exc)
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "git diff failed").strip()
+        return "", trim_tail(error)
+    return result.stdout, None
+
+
+def make_untracked_file_diff(working_dir: str, path: str) -> tuple[str, str | None]:
+    absolute_path = Path(working_dir) / path
+    if not absolute_path.is_file():
+        return "", "not_a_regular_file"
+    try:
+        with absolute_path.open("rb") as file:
+            data = file.read(MAX_DIFF_CHARS + 1)
+    except OSError as exc:
+        return "", str(exc)
+    if len(data) > MAX_DIFF_CHARS:
+        data = data[:MAX_DIFF_CHARS]
+
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    diff = "".join(
+        difflib.unified_diff(
+            [],
+            lines,
+            fromfile="/dev/null",
+            tofile=f"b/{normalize_git_path(path)}",
+        )
+    )
+    return f"diff --git a/{normalize_git_path(path)} b/{normalize_git_path(path)}\nnew file mode 100644\n{diff}", None
+
+
+def truncate_diff(diff: str, max_chars: int) -> tuple[str, bool]:
+    if len(diff) <= max_chars:
+        return diff, False
+    return diff[:max_chars], True
 
 
 def evaluate_path_policy(
@@ -1085,6 +1514,7 @@ def job_to_result(
             "server_id": job.server_id,
             "server_url": job.server_url,
             "attached_to_server": job.attached_to_server,
+            "server_recovered_from_registry": job.server_recovered_from_registry,
             "changed_files": list(job.changed_files),
             "preexisting_changed_files": list(job.preexisting_changed_files),
             "all_changed_files": list(job.all_changed_files),
@@ -1146,6 +1576,7 @@ def make_job_not_found_result(job_id: str) -> dict:
         "server_id": None,
         "server_url": None,
         "attached_to_server": False,
+        "server_recovered_from_registry": False,
         "changed_files": [],
         "preexisting_changed_files": [],
         "all_changed_files": [],
@@ -1209,6 +1640,7 @@ def make_start_failed_result(
     session_id: str | None,
     attached_to_server: bool,
     error: str,
+    server_recovered_from_registry: bool = False,
 ) -> dict:
     job = OpenCodeJob(
         job_id=uuid.uuid4().hex,
@@ -1226,6 +1658,7 @@ def make_start_failed_result(
         server_url=server_url,
         session_id=session_id,
         attached_to_server=attached_to_server,
+        server_recovered_from_registry=server_recovered_from_registry,
         status="failed",
         exit_code=None,
         finished_at=utc_now(),
@@ -1258,10 +1691,10 @@ def start_job(
     resolved_working_dir, cwd_key = normalize_working_dir(working_dir)
     server_url: str | None = None
     attached_to_server = False
+    server_recovered_from_registry = False
 
     if server_id:
-        with _SERVER_REGISTRY_LOCK:
-            server = _SERVERS.get(server_id)
+        server, registry_error = get_server_for_lookup(server_id)
         if server is None:
             command = [
                 resolve_opencode(),
@@ -1270,6 +1703,9 @@ def start_job(
                 f"<missing server_id={server_id}>",
                 f"<prompt chars={len(prompt)}>",
             ]
+            error = f"server_id not found: {server_id}"
+            if registry_error:
+                error = f"{error}; {registry_error}"
             result = make_start_failed_result(
                 working_dir=resolved_working_dir,
                 cwd_key=cwd_key,
@@ -1285,7 +1721,7 @@ def start_job(
                 server_url=None,
                 session_id=session_id,
                 attached_to_server=False,
-                error=f"server_id not found: {server_id}",
+                error=error,
             )
             return None, result
 
@@ -1318,10 +1754,12 @@ def start_job(
                 session_id=session_id,
                 attached_to_server=True,
                 error=f"server_id is not running: {server_id}",
+                server_recovered_from_registry=server.recovered_from_registry,
             )
             return None, result
         server_url = server.url
         attached_to_server = True
+        server_recovered_from_registry = server.recovered_from_registry
 
     command = build_opencode_command(
         prompt,
@@ -1350,6 +1788,7 @@ def start_job(
             server_url=server_url,
             session_id=session_id,
             attached_to_server=attached_to_server,
+            server_recovered_from_registry=server_recovered_from_registry,
             error=f"working_dir does not exist or is not a directory: {resolved_working_dir}",
         )
         return None, result
@@ -1385,6 +1824,7 @@ def start_job(
             server_url=server_url,
             session_id=session_id,
             attached_to_server=attached_to_server,
+            server_recovered_from_registry=server_recovered_from_registry,
             summary="OpenCode process is starting.",
         )
         initial_snapshot = collect_git_status(resolved_working_dir)
@@ -1523,6 +1963,7 @@ def opencode_server_start(
     monitor_thread.start()
 
     if wait_for_server_port(server):
+        persist_server_record(server)
         return server_to_result(server)
 
     with server.lock:
@@ -1544,22 +1985,103 @@ def opencode_server_start(
 @mcp.tool()
 def opencode_server_status(server_id: str) -> dict:
     """查询 MCP 托管 opencode server 的运行状态。"""
-    with _SERVER_REGISTRY_LOCK:
-        server = _SERVERS.get(server_id)
+    server, registry_error = get_server_for_lookup(server_id)
     if server is None:
-        return make_server_not_found_result(server_id)
+        status = "lost" if registry_error and "registry_stale" in registry_error else "not_found"
+        error = "server_lost" if status == "lost" else "server_not_found"
+        return make_server_not_found_result(
+            server_id,
+            status=status,
+            error=error,
+            registry_error=registry_error,
+        )
     return server_to_result(server)
+
+
+@mcp.tool()
+def opencode_server_list(
+    working_dir: str | None = None,
+    include_lost: bool = False,
+) -> dict:
+    """列出当前内存和 registry 中可见的 MCP 托管 opencode servers。"""
+    registry_path = get_server_registry_path()
+    registry_errors: list[str] = []
+    with _SERVER_REGISTRY_LOCK:
+        memory_servers = list(_SERVERS.values())
+        registry_data, registry_error = load_server_registry_unlocked()
+        registry_records = dict(registry_data.get("servers", {})) if registry_error is None else {}
+    if registry_error:
+        registry_errors.append(registry_error)
+
+    servers: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for server in memory_servers:
+        result = server_to_result(server)
+        seen_ids.add(result["server_id"])
+        if not working_dir_matches_filter(result.get("working_dir"), working_dir):
+            continue
+        if not include_lost and result["status"] == "lost":
+            continue
+        servers.append(result)
+
+    for server_id, record in registry_records.items():
+        if server_id in seen_ids:
+            continue
+        if not working_dir_matches_filter(record.get("working_dir") if isinstance(record, dict) else None, working_dir):
+            continue
+
+        recovered, recover_error = recover_server_from_registry(server_id)
+        if recovered is not None:
+            result = server_to_result(recovered)
+            if include_lost or result["status"] != "lost":
+                servers.append(result)
+            continue
+
+        if recover_error:
+            registry_errors.append(f"{server_id}: {recover_error}")
+        if include_lost:
+            servers.append(make_server_lost_result(server_id, record, recover_error or "server_not_found"))
+
+    servers.sort(key=lambda item: ((item.get("working_dir") or "").casefold(), item.get("server_id") or ""))
+    return {
+        "servers": servers,
+        "count": len(servers),
+        "registry_path": registry_path,
+        "registry_error": "; ".join(dict.fromkeys(registry_errors)) or None,
+        "success": registry_error is None,
+    }
 
 
 @mcp.tool()
 def opencode_server_stop(server_id: str) -> dict:
     """停止 MCP 托管 opencode server。"""
-    with _SERVER_REGISTRY_LOCK:
-        server = _SERVERS.get(server_id)
+    server, registry_error = get_server_for_lookup(server_id)
     if server is None:
-        return make_server_not_found_result(server_id)
+        status = "lost" if registry_error and "registry_stale" in registry_error else "not_found"
+        error = "server_lost" if status == "lost" else "server_not_found"
+        return make_server_not_found_result(
+            server_id,
+            status=status,
+            error=error,
+            registry_error=registry_error,
+        )
 
     process = server.process
+    if process is None and server.recovered_from_registry:
+        refresh_server_status(server)
+        with server.lock:
+            server.registry_path = server.registry_path or get_server_registry_path()
+            should_report_limitation = server.status == "running"
+        result = server_to_result(server)
+        if should_report_limitation:
+            result["success"] = False
+            result["error"] = (
+                "server was recovered from registry; process handle and stdout/stderr "
+                "pipes are not available, so opencode_server_stop will not blind-kill the pid"
+            )
+        return result
+
     if process is not None and process.poll() is None:
         with server.lock:
             server.status = "stopping"
@@ -1573,6 +2095,11 @@ def opencode_server_stop(server_id: str) -> dict:
 
     server.done_event.wait(timeout=2)
     refresh_server_status(server)
+    remove_error = remove_server_record(server.server_id)
+    if remove_error:
+        with server.lock:
+            server.registry_path = get_server_registry_path()
+            server.registry_error = remove_error
     return server_to_result(server)
 
 
@@ -1692,6 +2219,140 @@ def opencode_coder_status(
         stdout_cursor=stdout_cursor,
         stderr_cursor=stderr_cursor,
     )
+
+
+@mcp.tool()
+def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) -> dict:
+    """基于 opencode_coder job 的本轮变更文件返回可 review 的 git diff。"""
+    cleanup_jobs()
+    effective_max_chars = clamp_diff_max_chars(max_chars)
+    with _REGISTRY_LOCK:
+        job = _JOBS.get(job_id)
+
+    if job is None:
+        return {
+            "job_id": job_id,
+            "status": "not_found",
+            "working_dir": None,
+            "new_changed_files": [],
+            "preexisting_changed_files": [],
+            "diff": "",
+            "diff_truncated": False,
+            "max_chars": effective_max_chars,
+            "undiffed_files": [],
+            "includes_preexisting_dirty_changes": False,
+            "git_status_available": False,
+            "error": "job_not_found",
+            "success": False,
+        }
+
+    if is_job_active(job):
+        refresh_job_snapshot(job)
+
+    with job.lock:
+        status = job.status
+        working_dir = job.working_dir
+        new_changed_files = list(job.new_changed_files)
+        preexisting_changed_files = list(job.preexisting_changed_files)
+        git_status_available = job.git_status_available
+        git_status_error = job.git_status_error
+
+    if not git_status_available:
+        return {
+            "job_id": job_id,
+            "status": status,
+            "working_dir": working_dir,
+            "new_changed_files": new_changed_files,
+            "preexisting_changed_files": preexisting_changed_files,
+            "diff": "",
+            "diff_truncated": False,
+            "max_chars": effective_max_chars,
+            "undiffed_files": list(new_changed_files),
+            "includes_preexisting_dirty_changes": False,
+            "git_status_available": False,
+            "error": git_status_error or "git_status_unavailable",
+            "success": False,
+        }
+
+    status_entries, status_error = collect_git_status_entry_map(working_dir)
+    if status_error is not None:
+        return {
+            "job_id": job_id,
+            "status": status,
+            "working_dir": working_dir,
+            "new_changed_files": new_changed_files,
+            "preexisting_changed_files": preexisting_changed_files,
+            "diff": "",
+            "diff_truncated": False,
+            "max_chars": effective_max_chars,
+            "undiffed_files": list(new_changed_files),
+            "includes_preexisting_dirty_changes": False,
+            "git_status_available": False,
+            "error": status_error,
+            "success": False,
+        }
+
+    preexisting_keys = {git_path_key(path) for path in preexisting_changed_files}
+    includes_preexisting_dirty_changes = any(
+        git_path_key(path) in preexisting_keys
+        for path in new_changed_files
+    )
+
+    tracked_paths: list[str] = []
+    untracked_paths: list[str] = []
+    for path in new_changed_files:
+        entry = status_entries.get(git_path_key(path))
+        if entry is not None and entry[1] == "??":
+            untracked_paths.append(path)
+        else:
+            tracked_paths.append(path)
+
+    diff_parts: list[str] = []
+    undiffed_files: list[str] = []
+    errors: list[str] = []
+
+    unstaged_diff, unstaged_error = run_git_diff(working_dir, tracked_paths, cached=False)
+    if unstaged_error:
+        errors.append(f"git diff failed: {unstaged_error}")
+        undiffed_files.extend(tracked_paths)
+    elif unstaged_diff:
+        diff_parts.append(unstaged_diff)
+
+    cached_diff, cached_error = run_git_diff(working_dir, tracked_paths, cached=True)
+    if cached_error:
+        errors.append(f"git diff --cached failed: {cached_error}")
+        for path in tracked_paths:
+            if path not in undiffed_files:
+                undiffed_files.append(path)
+    elif cached_diff:
+        diff_parts.append(cached_diff)
+
+    for path in untracked_paths:
+        untracked_diff, untracked_error = make_untracked_file_diff(working_dir, path)
+        if untracked_error:
+            undiffed_files.append(path)
+            errors.append(f"{path}: {untracked_error}")
+        elif untracked_diff:
+            diff_parts.append(untracked_diff)
+
+    full_diff = "\n".join(part.rstrip("\n") for part in diff_parts if part)
+    diff, diff_truncated = truncate_diff(full_diff, effective_max_chars)
+    undiffed_files = unique_sorted_paths(undiffed_files)
+    return {
+        "job_id": job_id,
+        "status": status,
+        "working_dir": working_dir,
+        "new_changed_files": new_changed_files,
+        "preexisting_changed_files": preexisting_changed_files,
+        "diff": diff,
+        "diff_truncated": diff_truncated,
+        "max_chars": effective_max_chars,
+        "undiffed_files": undiffed_files,
+        "includes_preexisting_dirty_changes": includes_preexisting_dirty_changes,
+        "git_status_available": True,
+        "error": "; ".join(errors) or None,
+        "success": not errors,
+    }
 
 
 def _reset_jobs_for_tests() -> None:
