@@ -189,6 +189,17 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `stderr_tail`
 - `started_at`
 - `finished_at`
+- `runtime_seconds`
+- `idle_seconds`
+- `is_stalled`
+- `stall_reason`
+- `suggested_action`
+- `review_required`
+- `incomplete_changes_risk`
+- `potential_incomplete_changes_risk`
+- `preexisting_dirty_warning`
+- `validation_status`
+- `validation_note`
 - `wait_policy`
 - `success`
 
@@ -221,6 +232,17 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
+- `runtime_seconds`
+- `idle_seconds`
+- `is_stalled`
+- `stall_reason`
+- `suggested_action`
+- `review_required`
+- `incomplete_changes_risk`
+- `potential_incomplete_changes_risk`
+- `preexisting_dirty_warning`
+- `validation_status`
+- `validation_note`
 
 完成的 job 默认至少在内存中保留 `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS` 秒，默认是 `3600`。
 
@@ -251,6 +273,37 @@ debug_status = opencode_coder_status(
     tail_max_chars=4000,
 )
 ```
+
+### Job 诊断与 Review 风险
+
+每个 job result 都会返回轻量诊断字段：
+
+- `runtime_seconds`：从 `started_at` 到 `finished_at` 的秒数；job 仍 active 时计算到当前时间。
+- `idle_seconds`：距离最近一次可信活动的秒数，活动时间按 `last_activity_at`、`first_output_at`、`started_at` 取最合理值。延迟首次观察到文件变更本身不会重置这个计时。
+- `is_stalled`：只对 active job 判断。为 `true` 表示超过 wrapper 的卡住阈值，但不等同于 failed。
+- `stall_reason`：可能是 `changed_files_no_recent_activity`、`no_output_no_change_after_start`、`no_recent_activity` 或 `timed_out_waiting_for_completion`。
+- `suggested_action`：给调用方的下一步建议，例如 `continue_polling`、`continue_polling_or_consider_cancel`、`consider_cancel`、`review_diff_then_consider_cancel`、`review_diff_or_git_status`。
+
+wrapper 不会因为这些字段自动 cancel、kill、回滚或清理文件。刚启动不久的 job 不应被标记为 stalled。`timed_out` 只表示本次 MCP 等待窗口结束但进程仍可能继续运行，应结合 `suggested_action`、`process_running` 和后续 status 决定继续轮询还是取消。
+
+半成品风险字段：
+
+- `review_required`：active、failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`；completed 但有 path policy violation 时也为 `true`。
+- `incomplete_changes_risk`：failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`。
+- `potential_incomplete_changes_risk`：active 且 stalled 的 job 已经存在 `new_changed_files` 时为 `true`。这是运行中疑似半成品的提前提醒，不替代 failed、cancelled、timed_out 场景下的 `incomplete_changes_risk`。
+- `preexisting_dirty_warning`：任务开始前工作区已有 dirty 文件时非空，提醒 `all_changed_files` 不能简单归因给本 job。
+
+active job 如果长时间没有 stdout/stderr 且没有文件变更，也可以被标记为 stalled；但由于没有观察到本 job 的文件改动，不会设置 `potential_incomplete_changes_risk`。
+
+failed、cancelled、timed_out 都不具备原子性；如果它们留下文件变更，必须 review `opencode_coder_diff`、本地 `git status` 和本地 `git diff`，再决定是否接受或继续处理当前工作区。
+
+验证字段保持保守：
+
+- `validation_status` 为 `not_run_by_wrapper`。
+- `validation_skipped_reason` 为 `not_run_by_wrapper`。
+- `validation_note` 会提醒调用方 wrapper 没有主动运行测试或验证。
+
+prompt 里要求 OpenCode 运行验证，不代表验证真的执行了。job 未 `completed` 时，prompt 内要求的验证很可能没有执行。调用方必须查看实际 stdout/stderr、OpenCode report 或本地验证结果。
 
 ### `opencode_coder_diff`
 
@@ -287,6 +340,9 @@ opencode_coder_diff(job_id, max_chars=20000)
 - `max_chars`
 - `undiffed_files`
 - `includes_preexisting_dirty_changes`
+- `review_required`
+- `incomplete_changes_risk`
+- `preexisting_dirty_warning`
 - `git_status_available`
 - `error`
 - `success`
@@ -294,6 +350,8 @@ opencode_coder_diff(job_id, max_chars=20000)
 `success=true` 表示包装层生成了可用 diff，或本 job 没有 `new_changed_files`。如果 `new_changed_files` 非空但当前工作区对这些文件已经没有可展示 diff，例如 job 期间改过又还原，工具会返回 `success=false`，并通过 `diff_empty_reason` 说明原因，如 `current_worktree_has_no_diff_for_job_files`。无法渲染为文本 diff 的文件，例如 untracked 二进制文件、过大文件、非普通文件，会进入 `undiffed_files`，原因记录在有界的 `diff_command_errors` 中。
 
 `opencode_coder_diff` 是 review aid，不是唯一审查来源。当 `success=false`、`diff_empty_reason` 非空、`diff_command_errors` 非空或 `undiffed_files` 非空时，应回退到本地 `git status` / `git diff` 复核。
+
+diff 结果也会携带和 status 一致的 review 风险字段。如果 `review_required=true`、`incomplete_changes_risk=true` 或 `preexisting_dirty_warning` 非空，不应只看 diff 文本就接受结果；需要同时检查 job status 和本地 git 状态。
 
 注意：这是 review 辅助，不保证是“只包含本 job 的纯 patch”。如果某个文件在 job 开始前已经 dirty，且本 job 又修改了它，git diff 可能混入任务前已有改动；此时返回 `includes_preexisting_dirty_changes=true`。
 

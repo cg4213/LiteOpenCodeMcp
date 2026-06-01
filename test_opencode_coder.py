@@ -85,12 +85,29 @@ def fake_command(
             "time.sleep(10)\n"
             "print('done', flush=True)\n"
         )
+    elif prompt == "no_output_long":
+        code = (
+            "import time\n"
+            "time.sleep(10)\n"
+        )
     elif prompt == "fail":
         code = (
             "import sys\n"
             "sys.stderr.write('boom\\n')\n"
             "sys.stderr.flush()\n"
             "raise SystemExit(7)\n"
+        )
+    elif prompt.startswith("fail_after_write:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('partial\\n', encoding='utf-8')\n"
+            "sys.stderr.write('failed after write\\n')\n"
+            "sys.stderr.flush()\n"
+            "raise SystemExit(9)\n"
         )
     elif prompt.startswith("write:"):
         path = prompt.split(":", 1)[1]
@@ -147,6 +164,16 @@ def fake_command(
             "path.parent.mkdir(parents=True, exist_ok=True)\n"
             "path.write_text('generated before cancel\\n', encoding='utf-8')\n"
             "print(f'wrote {path}', flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt.startswith("write_silent_then_sleep:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "import time\n"
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('generated before stall\\n', encoding='utf-8')\n"
             "time.sleep(10)\n"
         )
     elif prompt.startswith("delayed_write:"):
@@ -267,6 +294,17 @@ def wait_for_terminal_job(job_id: str, total_wait_seconds: float = 3.0) -> dict:
     return status
 
 
+def wait_for_job_change(job_id: str, total_wait_seconds: float = 3.0) -> dict:
+    deadline = time.monotonic() + total_wait_seconds
+    status = server.opencode_coder_status(job_id)
+    while not status["new_changed_files"] and status["status"] not in TERMINAL_JOB_STATUSES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return status
+        status = server.opencode_coder_status(job_id, wait_seconds=min(0.25, remaining))
+    return status
+
+
 def read_test_registry() -> dict:
     path = Path(server.get_server_registry_path())
     if not path.exists():
@@ -324,6 +362,16 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["exit_code"], 0)
         self.assertIn("ok", result["stdout_tail"])
+        self.assertFalse(result["is_stalled"])
+        self.assertIsNone(result["stall_reason"])
+        self.assertGreaterEqual(result["runtime_seconds"], 0)
+        self.assertGreaterEqual(result["idle_seconds"], 0)
+        self.assertFalse(result["review_required"])
+        self.assertFalse(result["incomplete_changes_risk"])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
+        self.assertEqual(result["preexisting_dirty_warning"], "")
+        self.assertEqual(result["validation_status"], "not_run_by_wrapper")
+        self.assertIn("does not run validation", result["validation_note"])
         self.assertIsNotNone(result["job_id"])
         self.assertEqual(result["preexisting_changed_files"], [])
         self.assertEqual(result["all_changed_files"], [])
@@ -402,6 +450,8 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_policy"], "first_change")
         self.assertEqual(result["new_changed_files"], ["src/new.txt"])
         self.assertIsNotNone(result["first_change_at"])
+        self.assertFalse(result["is_stalled"])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
         self.assertFalse(result["policy_violation"])
         self.assertEqual(final_status["status"], "completed")
 
@@ -1013,6 +1063,8 @@ class OpenCodeCoderTests(unittest.TestCase):
             self.assertEqual(result["status"], "timed_out")
             self.assertTrue(result["process_running"])
             self.assertIsNotNone(result["pid"])
+            self.assertEqual(result["suggested_action"], "continue_polling_or_consider_cancel")
+            self.assertIn("not completed", result["validation_note"])
 
             job_id = result["job_id"]
             running_status = server.opencode_coder_status(job_id)
@@ -1026,6 +1078,178 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(final_status["process_running"])
         self.assertIn("begin", final_output["stdout_tail"])
         self.assertIn("done", final_output["stdout_tail"])
+
+    def test_running_job_just_started_is_not_stalled(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "no_output_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertFalse(status["is_stalled"])
+        self.assertIsNone(status["stall_reason"])
+        self.assertEqual(status["suggested_action"], "continue_polling")
+        self.assertFalse(status["potential_incomplete_changes_risk"])
+
+    def test_no_output_running_job_reports_stalled_after_threshold(self):
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_OUTPUT_SECONDS = 0.1
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                time.sleep(0.15)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["stall_reason"], "no_output_no_change_after_start")
+        self.assertEqual(status["suggested_action"], "consider_cancel")
+        self.assertEqual(status["new_changed_files"], [])
+        self.assertFalse(status["incomplete_changes_risk"])
+        self.assertFalse(status["potential_incomplete_changes_risk"])
+
+    def test_running_job_with_changed_files_reports_stalled_after_idle_threshold(self):
+        original_changed_files = server.STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS
+        original_no_activity = server.STALL_NO_ACTIVITY_SECONDS
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = 0.1
+        server.STALL_NO_ACTIVITY_SECONDS = 100.0
+        server.STALL_NO_OUTPUT_SECONDS = 100.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                init_git_repo(working_dir)
+                result = server.opencode_coder(
+                    "write_silent_then_sleep:src/pending.txt",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="first_change",
+                    allowed_paths=["src"],
+                )
+                time.sleep(0.15)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = original_changed_files
+            server.STALL_NO_ACTIVITY_SECONDS = original_no_activity
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["new_changed_files"], ["src/pending.txt"])
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["stall_reason"], "changed_files_no_recent_activity")
+        self.assertEqual(status["suggested_action"], "review_diff_then_consider_cancel")
+        self.assertTrue(status["review_required"])
+        self.assertFalse(status["incomplete_changes_risk"])
+        self.assertTrue(status["potential_incomplete_changes_risk"])
+
+    def test_delayed_first_status_after_start_only_change_reports_stalled(self):
+        original_changed_files = server.STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS
+        original_no_activity = server.STALL_NO_ACTIVITY_SECONDS
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = 0.1
+        server.STALL_NO_ACTIVITY_SECONDS = 100.0
+        server.STALL_NO_OUTPUT_SECONDS = 100.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                init_git_repo(working_dir)
+                result = server.opencode_coder(
+                    "write_silent_then_sleep:src/delayed.txt",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                    allowed_paths=["src"],
+                )
+                time.sleep(0.2)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = original_changed_files
+            server.STALL_NO_ACTIVITY_SECONDS = original_no_activity
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["new_changed_files"], ["src/delayed.txt"])
+        self.assertGreaterEqual(status["idle_seconds"], 0.1)
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["stall_reason"], "changed_files_no_recent_activity")
+        self.assertEqual(status["suggested_action"], "review_diff_then_consider_cancel")
+        self.assertTrue(status["review_required"])
+        self.assertFalse(status["incomplete_changes_risk"])
+        self.assertTrue(status["potential_incomplete_changes_risk"])
+
+    def test_running_job_with_output_reports_stalled_after_idle_threshold(self):
+        original_no_activity = server.STALL_NO_ACTIVITY_SECONDS
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_ACTIVITY_SECONDS = 0.1
+        server.STALL_NO_OUTPUT_SECONDS = 100.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "very_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="first_output",
+                )
+                time.sleep(0.15)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_NO_ACTIVITY_SECONDS = original_no_activity
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["stall_reason"], "no_recent_activity")
+        self.assertEqual(status["suggested_action"], "consider_cancel")
+        self.assertFalse(status["potential_incomplete_changes_risk"])
+
+    def test_status_wait_seconds_recomputes_stall_after_wait(self):
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_OUTPUT_SECONDS = 0.1
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                status = server.opencode_coder_status(result["job_id"], wait_seconds=0.25)
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["stall_reason"], "no_output_no_change_after_start")
+        self.assertEqual(status["suggested_action"], "consider_cancel")
+
+    def test_timed_out_running_job_has_clear_suggested_action(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("no_output_long", working_dir=working_dir, timeout_seconds=0)
+            try:
+                status = server.opencode_coder_status(result["job_id"])
+            finally:
+                server.opencode_coder_cancel(result["job_id"])
+
+        self.assertEqual(status["status"], "timed_out")
+        self.assertTrue(status["process_running"])
+        self.assertEqual(status["suggested_action"], "continue_polling_or_consider_cancel")
+        self.assertFalse(status["is_stalled"])
+        self.assertFalse(status["potential_incomplete_changes_risk"])
 
     def test_same_cwd_running_job_rejects_second_default_call(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1050,6 +1274,58 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 7)
         self.assertEqual(result["return_code"], 7)
         self.assertIn("boom", result["stderr_tail"])
+        self.assertFalse(result["is_stalled"])
+        self.assertFalse(result["review_required"])
+        self.assertFalse(result["incomplete_changes_risk"])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
+        self.assertIn("not completed", result["validation_note"])
+
+    def test_failed_job_with_changes_reports_incomplete_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder("fail_after_write:src/partial.txt", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["new_changed_files"], ["src/partial.txt"])
+        self.assertTrue(result["review_required"])
+        self.assertTrue(result["incomplete_changes_risk"])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
+        self.assertEqual(result["suggested_action"], "review_diff_or_git_status")
+
+    def test_timed_out_job_with_changes_reports_review_required(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder("write_then_sleep:src/pending.txt", working_dir=working_dir, timeout_seconds=0)
+            try:
+                status = wait_for_job_change(result["job_id"])
+            finally:
+                server.opencode_coder_cancel(result["job_id"])
+
+        self.assertEqual(status["status"], "timed_out")
+        self.assertEqual(status["new_changed_files"], ["src/pending.txt"])
+        self.assertTrue(status["review_required"])
+        self.assertTrue(status["incomplete_changes_risk"])
+        self.assertFalse(status["potential_incomplete_changes_risk"])
+
+    def test_cancelled_job_with_changes_reports_incomplete_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write_then_sleep:src/cancelled.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+            )
+            self.assertIn(result["status"], {"running", "timed_out"})
+            self.assertTrue(result["review_required"])
+            cancelled = server.opencode_coder_cancel(result["job_id"])
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["new_changed_files"], ["src/cancelled.txt"])
+        self.assertTrue(cancelled["review_required"])
+        self.assertTrue(cancelled["incomplete_changes_risk"])
+        self.assertFalse(cancelled["potential_incomplete_changes_risk"])
+        self.assertEqual(cancelled["suggested_action"], "review_diff_or_git_status")
 
     def test_new_file_enters_new_and_all_changed_files(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1062,6 +1338,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["new_changed_files"], ["src/new.txt"])
         self.assertEqual(result["all_changed_files"], ["src/new.txt"])
         self.assertEqual(result["changed_files"], result["all_changed_files"])
+        self.assertFalse(result["review_required"])
+        self.assertFalse(result["incomplete_changes_risk"])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
 
     def test_preexisting_dirty_file_is_not_counted_as_new(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1078,6 +1357,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["new_changed_files"], ["src/new.txt"])
         self.assertEqual(result["all_changed_files"], ["old.txt", "src/new.txt"])
         self.assertFalse(result["policy_violation"])
+        self.assertIn("preexisting dirty", result["preexisting_dirty_warning"])
 
     def test_preexisting_dirty_file_modified_again_triggers_forbidden_policy(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1140,6 +1420,40 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIn("+generated", diff["diff"])
         self.assertEqual(diff["diff_source_files"], ["src/new.txt"])
         self.assertIsNone(diff["diff_empty_reason"])
+        self.assertFalse(diff["review_required"])
+        self.assertFalse(diff["incomplete_changes_risk"])
+        self.assertEqual(diff["preexisting_dirty_warning"], "")
+
+    def test_coder_diff_failed_job_with_changes_reports_review_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            job = server.opencode_coder("fail_after_write:src/partial.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertEqual(diff["status"], "failed")
+        self.assertEqual(diff["new_changed_files"], ["src/partial.txt"])
+        self.assertTrue(diff["success"])
+        self.assertTrue(diff["review_required"])
+        self.assertTrue(diff["incomplete_changes_risk"])
+        self.assertEqual(diff["preexisting_dirty_warning"], "")
+        self.assertIn("+partial", diff["diff"])
+
+    def test_coder_diff_timed_out_job_with_changes_reports_review_risk(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            job = server.opencode_coder("write_then_sleep:src/pending.txt", working_dir=working_dir, timeout_seconds=0)
+            try:
+                status = wait_for_job_change(job["job_id"])
+                diff = server.opencode_coder_diff(job["job_id"])
+            finally:
+                server.opencode_coder_cancel(job["job_id"])
+
+        self.assertEqual(status["status"], "timed_out")
+        self.assertEqual(diff["status"], "timed_out")
+        self.assertEqual(diff["new_changed_files"], ["src/pending.txt"])
+        self.assertTrue(diff["review_required"])
+        self.assertTrue(diff["incomplete_changes_risk"])
+        self.assertIn("+generated before cancel", diff["diff"])
 
     def test_coder_diff_returns_deleted_tracked_file_diff(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1195,6 +1509,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(diff["preexisting_changed_files"], ["old.txt"])
         self.assertTrue(diff["includes_preexisting_dirty_changes"])
         self.assertIn("+generated", diff["diff"])
+        self.assertIn("preexisting dirty", diff["preexisting_dirty_warning"])
 
     def test_coder_diff_reports_empty_reason_when_job_reverts_dirty_file(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1255,6 +1570,8 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertTrue(result["policy_violation"])
         self.assertEqual(result["extra_changed_files"], ["docs/outside.txt"])
         self.assertEqual(result["forbidden_changed_files"], [])
+        self.assertTrue(result["review_required"])
+        self.assertFalse(result["incomplete_changes_risk"])
 
     def test_forbidden_paths_reports_forbidden_changed_files(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1414,8 +1731,10 @@ class OpenCodeCoderTests(unittest.TestCase):
             self.assertFalse(result["process_tree_kill_succeeded"])
             self.assertIsNone(result["process_tree_kill_error"])
         self.assertFalse(result["process_running"])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
         self.assertEqual(status["status"], "cancelled")
         self.assertFalse(status["process_running"])
+        self.assertFalse(status["potential_incomplete_changes_risk"])
 
     def test_cancel_releases_cwd_lock_for_next_job(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1446,6 +1765,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["process_tree_kill_succeeded"])
         self.assertIsNone(result["process_tree_kill_error"])
         self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["potential_incomplete_changes_risk"])
 
     def test_cancel_missing_job_returns_structured_not_found(self):
         result = server.opencode_coder_cancel("missing-job")
@@ -1497,6 +1817,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["policy_violation"])
         self.assertEqual(result["extra_changed_files"], [])
         self.assertEqual(result["forbidden_changed_files"], [])
+        self.assertFalse(result["potential_incomplete_changes_risk"])
 
 
 class OpenCodeCoderIntegrationTests(unittest.TestCase):

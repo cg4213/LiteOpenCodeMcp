@@ -37,6 +37,9 @@ DEFAULT_DIFF_MAX_CHARS = 20_000
 MAX_DIFF_CHARS = 200_000
 MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES = 50
 MAX_PATH_POLICY_DIAGNOSTIC_CHARS = 300
+STALL_NO_ACTIVITY_SECONDS = 120.0
+STALL_NO_OUTPUT_SECONDS = 120.0
+STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = 120.0
 ACTIVE_STATUSES = {"starting", "running", "timed_out"}
 VALID_WAIT_POLICIES = {"completion", "start_only", "first_output", "first_change"}
 SERVER_REGISTRY_VERSION = 1
@@ -108,6 +111,8 @@ class OpenCodeJob:
     first_output_at: str | None = None
     first_change_at: str | None = None
     last_activity_at: str | None = None
+    last_git_snapshot_at: str | None = None
+    last_trusted_change_activity_at: str | None = None
     output_version: int = 0
     change_version: int = 0
     cancel_requested: bool = False
@@ -1508,6 +1513,10 @@ def evaluate_path_policy(
 
 def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_preexisting: bool = False) -> None:
     with job.lock:
+        now = utc_now()
+        now_seconds = parse_timestamp_seconds(now)
+        previous_snapshot_seconds = parse_timestamp_seconds(job.last_git_snapshot_at)
+        snapshot_gap_seconds = elapsed_seconds(previous_snapshot_seconds, now_seconds)
         if set_preexisting:
             job.preexisting_changed_files = list(snapshot.files) if snapshot.available else []
             job.preexisting_file_fingerprints = dict(snapshot.fingerprints) if snapshot.available else {}
@@ -1546,10 +1555,11 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
         job.observed_change_fingerprints = current_change_fingerprints
         job.changed_files = all_changed_files
         if new_changed_files and current_change_fingerprints != previous_change_fingerprints:
-            now = utc_now()
             if job.first_change_at is None:
                 job.first_change_at = now
-            job.last_activity_at = now
+            if snapshot_gap_seconds is not None and snapshot_gap_seconds <= STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS:
+                job.last_activity_at = now
+                job.last_trusted_change_activity_at = now
             job.change_version += 1
             job.change_event.set()
         job.policy_violation = policy_violation
@@ -1560,6 +1570,7 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
         job.git_root = snapshot.git_root
         job.git_root_error = snapshot.git_root_error
         job.path_policy_diagnostics = path_policy_diagnostics
+        job.last_git_snapshot_at = now
 
 
 def refresh_job_snapshot(job: OpenCodeJob) -> None:
@@ -1713,6 +1724,126 @@ def cleanup_jobs() -> None:
                         _CWD_ACTIVE_JOBS.pop(job.cwd_key, None)
 
 
+def parse_timestamp_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def elapsed_seconds(start: float | None, end: float | None) -> float | None:
+    if start is None or end is None:
+        return None
+    return round(max(0.0, end - start), 3)
+
+
+def most_recent_activity_seconds(job: OpenCodeJob) -> float | None:
+    candidates = [
+        parse_timestamp_seconds(job.last_activity_at),
+        parse_timestamp_seconds(job.first_output_at),
+        parse_timestamp_seconds(job.last_trusted_change_activity_at),
+        parse_timestamp_seconds(job.started_at),
+    ]
+    available = [candidate for candidate in candidates if candidate is not None]
+    if not available:
+        return None
+    return max(available)
+
+
+def build_stall_diagnostics(
+    job: OpenCodeJob,
+    *,
+    status: str,
+    process_running: bool,
+    runtime_seconds: float | None,
+    idle_seconds: float | None,
+) -> dict:
+    is_active = status in ACTIVE_STATUSES and process_running
+    is_stalled = False
+    stall_reason = None
+
+    if is_active:
+        has_new_changes = bool(job.new_changed_files)
+        has_output_or_changes = bool(job.first_output_at or job.first_change_at)
+        if (
+            has_new_changes
+            and idle_seconds is not None
+            and idle_seconds >= STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS
+        ):
+            is_stalled = True
+            stall_reason = "changed_files_no_recent_activity"
+        elif (
+            not has_output_or_changes
+            and runtime_seconds is not None
+            and runtime_seconds >= STALL_NO_OUTPUT_SECONDS
+        ):
+            is_stalled = True
+            stall_reason = "no_output_no_change_after_start"
+        elif (
+            idle_seconds is not None
+            and idle_seconds >= STALL_NO_ACTIVITY_SECONDS
+        ):
+            is_stalled = True
+            stall_reason = "timed_out_waiting_for_completion" if status == "timed_out" else "no_recent_activity"
+
+    if is_active:
+        if is_stalled:
+            suggested_action = "review_diff_then_consider_cancel" if job.new_changed_files else "consider_cancel"
+        elif status == "timed_out":
+            suggested_action = "continue_polling_or_consider_cancel"
+        else:
+            suggested_action = "continue_polling"
+    elif status in {"failed", "cancelled", "timed_out"} and job.new_changed_files:
+        suggested_action = "review_diff_or_git_status"
+    elif status == "completed" and job.policy_violation:
+        suggested_action = "review_policy_violation"
+    elif status == "completed":
+        suggested_action = "review_result"
+    else:
+        suggested_action = "inspect_status"
+
+    return {
+        "is_stalled": is_stalled,
+        "stall_reason": stall_reason,
+        "suggested_action": suggested_action,
+        "potential_incomplete_changes_risk": is_active and is_stalled and bool(job.new_changed_files),
+    }
+
+
+def build_change_risk_fields(job: OpenCodeJob, status: str) -> dict:
+    has_new_changes = bool(job.new_changed_files)
+    review_required = (
+        ((status in ACTIVE_STATUSES or status in {"failed", "cancelled"}) and has_new_changes)
+        or (status == "completed" and job.policy_violation)
+    )
+    incomplete_changes_risk = status in {"failed", "cancelled", "timed_out"} and has_new_changes
+    if job.preexisting_changed_files:
+        preexisting_dirty_warning = (
+            f"Worktree had {len(job.preexisting_changed_files)} preexisting dirty file(s) before this job; "
+            "all_changed_files may include changes that cannot be attributed solely to this job."
+        )
+    else:
+        preexisting_dirty_warning = ""
+    return {
+        "review_required": review_required,
+        "incomplete_changes_risk": incomplete_changes_risk,
+        "preexisting_dirty_warning": preexisting_dirty_warning,
+    }
+
+
+def build_validation_note(status: str) -> str:
+    base = (
+        "The MCP wrapper does not run validation. A prompt asking OpenCode to run validation "
+        "is not proof that validation actually ran; inspect stdout/stderr, the OpenCode report, "
+        "or local validation results."
+    )
+    if status != "completed":
+        return f"{base} This job is not completed, so prompt-requested validation may not have run."
+    return base
+
+
 def job_to_result(
     job: OpenCodeJob,
     *,
@@ -1750,6 +1881,21 @@ def job_to_result(
             output = trim_tail_chars((full_stdout_tail + "\n" + full_stderr_tail).strip(), effective_tail_max_chars)
         status = job.status
         success = status == "completed" and job.exit_code == 0
+        now_timestamp = datetime.now(timezone.utc).timestamp()
+        started_timestamp = parse_timestamp_seconds(job.started_at)
+        finished_timestamp = parse_timestamp_seconds(job.finished_at)
+        end_timestamp = finished_timestamp if finished_timestamp is not None else now_timestamp
+        runtime_seconds = elapsed_seconds(started_timestamp, end_timestamp)
+        idle_seconds = elapsed_seconds(most_recent_activity_seconds(job), end_timestamp)
+        stall_diagnostics = build_stall_diagnostics(
+            job,
+            status=status,
+            process_running=process_running,
+            runtime_seconds=runtime_seconds,
+            idle_seconds=idle_seconds,
+        )
+        change_risk_fields = build_change_risk_fields(job, status)
+        validation_note = build_validation_note(status)
         summary = summary_override or job.summary
         if not summary:
             if status == "timed_out":
@@ -1787,7 +1933,7 @@ def job_to_result(
             "git_status_available": job.git_status_available,
             "git_status_error": job.git_status_error,
             "tests_run": [],
-            "validation_skipped_reason": "MCP wrapper does not run validation; inspect OpenCode output or task-level tooling.",
+            "validation_skipped_reason": "not_run_by_wrapper",
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
             "stdout_delta": stdout_delta,
@@ -1801,6 +1947,15 @@ def job_to_result(
             "first_output_at": job.first_output_at,
             "first_change_at": job.first_change_at,
             "last_activity_at": job.last_activity_at,
+            "runtime_seconds": runtime_seconds,
+            "idle_seconds": idle_seconds,
+            "is_stalled": stall_diagnostics["is_stalled"],
+            "stall_reason": stall_diagnostics["stall_reason"],
+            "suggested_action": stall_diagnostics["suggested_action"],
+            "review_required": change_risk_fields["review_required"],
+            "incomplete_changes_risk": change_risk_fields["incomplete_changes_risk"],
+            "potential_incomplete_changes_risk": stall_diagnostics["potential_incomplete_changes_risk"],
+            "preexisting_dirty_warning": change_risk_fields["preexisting_dirty_warning"],
             "command": job.command_summary,
             "wait_policy": job.wait_policy,
             "requested_timeout_seconds": job.requested_timeout_seconds,
@@ -1819,6 +1974,8 @@ def job_to_result(
             "output": output,
             "return_code": job.exit_code,
             "error": job.error,
+            "validation_status": "not_run_by_wrapper",
+            "validation_note": validation_note,
         }
 
 
@@ -1849,7 +2006,7 @@ def make_job_not_found_result(job_id: str) -> dict:
         "git_status_available": False,
         "git_status_error": "job_not_found",
         "tests_run": [],
-        "validation_skipped_reason": "No job was found to validate.",
+        "validation_skipped_reason": "not_run_by_wrapper",
         "stdout_tail": "",
         "stderr_tail": "",
         "stdout_delta": "",
@@ -1863,6 +2020,15 @@ def make_job_not_found_result(job_id: str) -> dict:
         "first_output_at": None,
         "first_change_at": None,
         "last_activity_at": None,
+        "runtime_seconds": None,
+        "idle_seconds": None,
+        "is_stalled": False,
+        "stall_reason": None,
+        "suggested_action": "check_job_id",
+        "review_required": False,
+        "incomplete_changes_risk": False,
+        "potential_incomplete_changes_risk": False,
+        "preexisting_dirty_warning": "",
         "command": None,
         "wait_policy": None,
         "requested_timeout_seconds": None,
@@ -1881,6 +2047,8 @@ def make_job_not_found_result(job_id: str) -> dict:
         "output": "",
         "return_code": None,
         "error": "job_not_found",
+        "validation_status": "not_run_by_wrapper",
+        "validation_note": "No job was found. The MCP wrapper did not run validation.",
     }
 
 
@@ -2511,6 +2679,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "max_chars": effective_max_chars,
             "undiffed_files": [],
             "includes_preexisting_dirty_changes": False,
+            "review_required": False,
+            "incomplete_changes_risk": False,
+            "preexisting_dirty_warning": "",
             "git_status_available": False,
             "error": "job_not_found",
             "success": False,
@@ -2528,6 +2699,7 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
         git_status_error = job.git_status_error
         job_git_root = job.git_root
         job_git_root_error = job.git_root_error
+        change_risk_fields = build_change_risk_fields(job, status)
 
     if not git_status_available:
         return {
@@ -2544,6 +2716,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "max_chars": effective_max_chars,
             "undiffed_files": list(new_changed_files),
             "includes_preexisting_dirty_changes": False,
+            "review_required": change_risk_fields["review_required"],
+            "incomplete_changes_risk": change_risk_fields["incomplete_changes_risk"],
+            "preexisting_dirty_warning": change_risk_fields["preexisting_dirty_warning"],
             "git_status_available": False,
             "error": git_status_error or "git_status_unavailable",
             "success": False,
@@ -2565,6 +2740,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "max_chars": effective_max_chars,
             "undiffed_files": list(new_changed_files),
             "includes_preexisting_dirty_changes": False,
+            "review_required": change_risk_fields["review_required"],
+            "incomplete_changes_risk": change_risk_fields["incomplete_changes_risk"],
+            "preexisting_dirty_warning": change_risk_fields["preexisting_dirty_warning"],
             "git_status_available": False,
             "error": status_error,
             "success": False,
@@ -2653,6 +2831,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
         "max_chars": effective_max_chars,
         "undiffed_files": undiffed_files,
         "includes_preexisting_dirty_changes": includes_preexisting_dirty_changes,
+        "review_required": change_risk_fields["review_required"],
+        "incomplete_changes_risk": change_risk_fields["incomplete_changes_risk"],
+        "preexisting_dirty_warning": change_risk_fields["preexisting_dirty_warning"],
         "git_status_available": True,
         "error": error_text,
         "success": success,

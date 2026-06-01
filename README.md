@@ -182,6 +182,17 @@ Job results also include:
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
+- `runtime_seconds`
+- `idle_seconds`
+- `is_stalled`
+- `stall_reason`
+- `suggested_action`
+- `review_required`
+- `incomplete_changes_risk`
+- `potential_incomplete_changes_risk`
+- `preexisting_dirty_warning`
+- `validation_status`
+- `validation_note`
 
 ### `opencode_coder_status`
 
@@ -236,6 +247,8 @@ Returns a structured result including:
 - `git_status_error`
 - `tests_run`
 - `validation_skipped_reason`
+- `validation_status`
+- `validation_note`
 - `stdout_tail`
 - `stderr_tail`
 - `stdout_delta`
@@ -249,6 +262,15 @@ Returns a structured result including:
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
+- `runtime_seconds`
+- `idle_seconds`
+- `is_stalled`
+- `stall_reason`
+- `suggested_action`
+- `review_required`
+- `incomplete_changes_risk`
+- `potential_incomplete_changes_risk`
+- `preexisting_dirty_warning`
 - `command`
 - `wait_policy`
 - `cancel_requested`
@@ -293,6 +315,60 @@ debug_status = opencode_coder_status(
 )
 ```
 
+### Job Diagnostics And Review Risk
+
+Every job result includes lightweight diagnostics:
+
+- `runtime_seconds`: seconds from `started_at` to `finished_at`, or to now while the
+  job is active.
+- `idle_seconds`: seconds since the most recent trusted activity, using
+  `last_activity_at`, `first_output_at`, then `started_at`. A delayed first
+  observation of file changes does not by itself reset this timer.
+- `is_stalled`: `true` only for active jobs that have exceeded the wrapper's stall
+  thresholds. A stalled job is not automatically failed.
+- `stall_reason`: `changed_files_no_recent_activity`,
+  `no_output_no_change_after_start`, `no_recent_activity`, or
+  `timed_out_waiting_for_completion` when applicable.
+- `suggested_action`: compact caller guidance such as `continue_polling`,
+  `continue_polling_or_consider_cancel`, `consider_cancel`,
+  `review_diff_then_consider_cancel`, or `review_diff_or_git_status`.
+
+The wrapper does not cancel, kill, revert, or clean files based on these fields.
+Freshly started jobs should remain `is_stalled=false`. `timed_out` means the MCP wait
+window elapsed while the process continued; use `suggested_action`,
+`process_running`, and later status calls to decide whether to keep polling or cancel.
+
+Review-risk fields make non-atomic outcomes explicit:
+
+- `review_required`: `true` when an active, failed, cancelled, or timed-out job has
+  `new_changed_files`, or when a completed job has a path-policy violation.
+- `incomplete_changes_risk`: `true` when a failed, cancelled, or timed-out job has
+  `new_changed_files`.
+- `potential_incomplete_changes_risk`: `true` when an active stalled job already has
+  `new_changed_files`. This is an early running-state warning and does not replace
+  `incomplete_changes_risk` for failed, cancelled, or timed-out jobs.
+- `preexisting_dirty_warning`: non-empty when the worktree already had dirty files
+  before the job. In that case, `all_changed_files` cannot be attributed solely to
+  this job.
+
+An active job with no stdout/stderr and no file changes can still be marked stalled,
+but it does not set `potential_incomplete_changes_risk` because no job-scoped file
+change has been observed.
+
+Failed, cancelled, and timed-out jobs are not atomic. If they changed files, review
+`opencode_coder_diff`, local `git status`, and local `git diff` before accepting or
+continuing from the worktree state.
+
+Validation fields are intentionally conservative:
+
+- `validation_status` is `not_run_by_wrapper`.
+- `validation_skipped_reason` is `not_run_by_wrapper`.
+- `validation_note` reminds callers that the wrapper did not run tests or validation.
+
+A prompt asking OpenCode to run validation is not proof that validation ran. If the
+job is not `completed`, prompt-requested validation may not have run at all. Callers
+must inspect actual stdout/stderr, an OpenCode report, or local validation output.
+
 ### `opencode_coder_diff`
 
 Returns a bounded git diff for a known `opencode_coder` job:
@@ -327,6 +403,9 @@ Returned fields:
 - `max_chars`
 - `undiffed_files`
 - `includes_preexisting_dirty_changes`
+- `review_required`
+- `incomplete_changes_risk`
+- `preexisting_dirty_warning`
 - `git_status_available`
 - `error`
 - `success`
@@ -348,6 +427,11 @@ Treat `opencode_coder_diff` as a review aid. When `success=false`,
 `diff_empty_reason` is set, `diff_command_errors` is non-empty, or
 `undiffed_files` is non-empty, fall back to local `git status` / `git diff` review
 before accepting the job result.
+
+The diff result also carries the same review-risk fields as status. If
+`review_required=true`, `incomplete_changes_risk=true`, or
+`preexisting_dirty_warning` is non-empty, do not rely on the diff text alone; inspect
+the job status and local git state before accepting the worktree.
 
 If `working_dir` is not a git repository, or git status fails, the tool returns a
 structured error with `git_status_available=false`. Missing jobs return
