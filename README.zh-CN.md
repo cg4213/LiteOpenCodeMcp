@@ -2,7 +2,109 @@
 
 [English README](README.md)
 
+[已有对话接入提示词](EXISTING_THREAD_OPENCODE_PROMPT.zh-CN.md)
+
 LiteOpenCodeMcp 是一个轻量 MCP 包装层，用于在 Codex 中把 `opencode` 当作可调度的代码工作对话来使用。它的重点不是替代 OpenCode，而是补齐调用侧需要的任务状态、进度轮询、路径约束、server/session 复用、取消、diff 审查和跨 MCP 重启后的 server 发现能力。
+
+## 安装与环境准备
+
+### 前置要求
+
+- Python 3.10 或更新版本。
+- Git CLI 已加入 `PATH`。
+- OpenCode CLI 已加入 `PATH`。
+- OpenCode 已完成可用的模型 provider / 认证配置，能够执行真实模型请求。
+
+OpenCode 官方安装文档见 <https://opencode.ai/docs/>。常见安装方式：
+
+```powershell
+# 有 Node.js/npm 时可跨平台使用
+npm install -g opencode-ai
+
+# 验证
+opencode --version
+opencode run "hello"
+```
+
+Windows 上 OpenCode 官方文档推荐 WSL 以获得更好的兼容性；如果使用原生 Windows，npm、Chocolatey、Scoop 等方式也可以工作。关键是启动 MCP server 的同一个环境必须能找到 `opencode` 可执行文件。
+
+使用本 wrapper 执行真实任务前，需要先配置 OpenCode 认证：
+
+```powershell
+opencode auth login
+opencode auth list
+```
+
+OpenCode 也可以按 provider 配置从环境变量或项目 `.env` 文件读取 API key。
+
+### Python 环境
+
+本项目使用官方 MCP Python SDK 的 FastMCP import path：
+
+```python
+from mcp.server.fastmcp import FastMCP
+```
+
+建议使用独立虚拟环境：
+
+```powershell
+cd D:\Develop\LiteOpenCodeMcp
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install "mcp[cli]"
+```
+
+Linux/macOS：
+
+```bash
+cd /path/to/LiteOpenCodeMcp
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install "mcp[cli]"
+```
+
+本地快速验证：
+
+```powershell
+python -m py_compile opencode-coder.py test_opencode_coder.py
+python -B -m unittest -v test_opencode_coder.py
+```
+
+真实 OpenCode integration smoke test 默认不运行；需要时见“真实 OpenCode Smoke Test”。
+
+### MCP 客户端配置
+
+在你的 MCP 客户端中把 `opencode-coder.py` 注册为 stdio MCP server。典型 JSON 配置如下：
+
+```json
+{
+  "mcpServers": {
+    "opencode_coder": {
+      "command": "D:\\Develop\\LiteOpenCodeMcp\\.venv\\Scripts\\python.exe",
+      "args": ["D:\\Develop\\LiteOpenCodeMcp\\opencode-coder.py"],
+      "env": {
+        "OPENCODE_CODER_MAX_WAIT_SECONDS": "110",
+        "OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS": "3600"
+      }
+    }
+  }
+}
+```
+
+请按本机实际路径调整 `command` 和 `args`。修改 MCP server 文件或工具 schema 后，需要重启 MCP 客户端或 MCP server 进程，新的工具 schema 才会加载。
+
+可选环境变量：
+
+- `OPENCODE_CODER_MAX_WAIT_SECONDS`：限制 MCP 同步等待上限，默认 `110`。
+- `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS`：完成 job 的内存保留时间，默认 `3600`。
+- `OPENCODE_CODER_REGISTRY_PATH`：覆盖 managed server registry JSON 路径。
+- `OPENCODE_CODER_RUN_INTEGRATION`：仅在运行真实 integration smoke test 时设为 `1`。
 
 ## 推荐使用方式
 

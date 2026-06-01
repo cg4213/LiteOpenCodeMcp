@@ -4,6 +4,115 @@
 
 Lightweight MCP wrapper for running `opencode` as a coding agent from Codex.
 
+## Installation
+
+### Prerequisites
+
+- Python 3.10 or newer.
+- Git CLI on `PATH`.
+- OpenCode CLI on `PATH`.
+- An OpenCode provider/auth setup that can run real model requests.
+
+OpenCode's official install docs are at <https://opencode.ai/docs/>. Common install
+options:
+
+```powershell
+# Cross-platform when Node.js/npm is available
+npm install -g opencode-ai
+
+# Verify
+opencode --version
+opencode run "hello"
+```
+
+On Windows, OpenCode's docs recommend WSL for the best experience, but native Windows
+install methods such as npm, Chocolatey, or Scoop can also work. Make sure the
+`opencode` executable is visible to the same environment that starts this MCP server.
+
+Configure OpenCode authentication before using this wrapper for real tasks:
+
+```powershell
+opencode auth login
+opencode auth list
+```
+
+OpenCode can also read provider keys from environment variables or a project `.env`
+file, depending on your provider setup.
+
+### Python Environment
+
+This wrapper uses the official MCP Python SDK import path:
+
+```python
+from mcp.server.fastmcp import FastMCP
+```
+
+Create an isolated environment and install the MCP SDK:
+
+```powershell
+cd D:\Develop\LiteOpenCodeMcp
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install "mcp[cli]"
+```
+
+Linux/macOS equivalent:
+
+```bash
+cd /path/to/LiteOpenCodeMcp
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install "mcp[cli]"
+```
+
+Quick local verification:
+
+```powershell
+python -m py_compile opencode-coder.py test_opencode_coder.py
+python -B -m unittest -v test_opencode_coder.py
+```
+
+The real OpenCode integration smoke test is opt-in; see
+[Integration Smoke Test](#integration-smoke-test).
+
+### MCP Client Configuration
+
+Register `opencode-coder.py` as a stdio MCP server in your MCP client. A typical JSON
+configuration looks like:
+
+```json
+{
+  "mcpServers": {
+    "opencode_coder": {
+      "command": "D:\\Develop\\LiteOpenCodeMcp\\.venv\\Scripts\\python.exe",
+      "args": ["D:\\Develop\\LiteOpenCodeMcp\\opencode-coder.py"],
+      "env": {
+        "OPENCODE_CODER_MAX_WAIT_SECONDS": "110",
+        "OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS": "3600"
+      }
+    }
+  }
+}
+```
+
+Adjust paths for your machine. After changing the MCP server file or its tool schema,
+restart the MCP client or the MCP server process so the new schema is loaded.
+
+Optional environment variables:
+
+- `OPENCODE_CODER_MAX_WAIT_SECONDS`: caps synchronous MCP wait time. Default `110`.
+- `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS`: finished job retention window. Default
+  `3600`.
+- `OPENCODE_CODER_REGISTRY_PATH`: override the managed server registry JSON path.
+- `OPENCODE_CODER_RUN_INTEGRATION`: set to `1` only when running the real integration
+  smoke test.
+
 ## Tools
 
 ### `opencode_coder`
