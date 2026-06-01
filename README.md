@@ -194,14 +194,23 @@ Parameters:
   immediate status response.
 - `stdout_cursor`: optional stdout cursor returned by a previous job/status result.
 - `stderr_cursor`: optional stderr cursor returned by a previous job/status result.
+- `include_tail`: optional debug flag. Defaults to `false`, so compact polling does
+  not resend `stdout_tail` / `stderr_tail`.
+- `include_output`: optional compatibility/debug flag. Defaults to `false`, so
+  compact polling does not resend legacy `output`.
+- `tail_max_chars`: optional tail/output character limit when either include flag is
+  enabled. The wrapper clamps this to a safe upper bound.
 
 When `wait_seconds` is greater than zero, status waits until the job completes, new
 stdout/stderr arrives, a new file change is detected, or the wait expires. Status
 queries never start a new OpenCode process.
 
-When a cursor is provided, the response includes `stdout_delta` and/or
-`stderr_delta` with only the text after that cursor. Cursors are character offsets
-inside a bounded in-memory buffer; they are not persistent log file offsets.
+By default, status responses are compact: `stdout_tail`, `stderr_tail`, and `output`
+are present for compatibility but empty. When a cursor is provided, the response
+includes `stdout_delta` and/or `stderr_delta` with only the text after that cursor.
+Cursors are character offsets inside a bounded in-memory buffer; they are not
+persistent log file offsets. Use `include_tail=true` only when debugging a job and
+cap it with `tail_max_chars` if the output may be large.
 
 Returns a structured result including:
 
@@ -271,9 +280,18 @@ print(next_status["stderr_delta"])
 
 Delta buffers are bounded by `MAX_DELTA_BUFFER_CHARS` inside the wrapper. If a cursor
 is older than the retained buffer, the wrapper returns the currently available suffix
-and sets `stdout_delta_truncated` or `stderr_delta_truncated` to `true`. Use
-`stdout_tail` and `stderr_tail` for compatibility, and use cursor/delta polling to
-avoid repeatedly transferring the same tail text.
+and sets `stdout_delta_truncated` or `stderr_delta_truncated` to `true`. Polling loops
+should use compact status plus cursor/delta fields; request tail fields only for
+targeted diagnostics:
+
+```python
+debug_status = opencode_coder_status(
+    job_id,
+    include_tail=True,
+    include_output=True,
+    tail_max_chars=4000,
+)
+```
 
 ### `opencode_coder_diff`
 
@@ -302,6 +320,9 @@ Returned fields:
 - `new_changed_files`
 - `preexisting_changed_files`
 - `diff`
+- `diff_empty_reason`
+- `diff_source_files`
+- `diff_command_errors`
 - `diff_truncated`
 - `max_chars`
 - `undiffed_files`
@@ -314,6 +335,19 @@ This is a review aid, not a guaranteed pure patch for only the current job. If a
 was already dirty before the job and the job touched it again, the returned git diff
 may include earlier dirty changes too; in that case
 `includes_preexisting_dirty_changes=true`.
+
+`success=true` means the wrapper produced a usable diff result or there were no
+`new_changed_files`. If `new_changed_files` is non-empty but the current worktree no
+longer has a displayable diff for those files, the tool returns `success=false` with
+`diff_empty_reason`, such as `current_worktree_has_no_diff_for_job_files`. Files that
+cannot be rendered as text diffs, including untracked binary files, oversized
+untracked files, and non-regular files, are listed in `undiffed_files`, with bounded
+details in `diff_command_errors`.
+
+Treat `opencode_coder_diff` as a review aid. When `success=false`,
+`diff_empty_reason` is set, `diff_command_errors` is non-empty, or
+`undiffed_files` is non-empty, fall back to local `git status` / `git diff` review
+before accepting the job result.
 
 If `working_dir` is not a git repository, or git status fails, the tool returns a
 structured error with `git_status_available=false`. Missing jobs return
@@ -536,7 +570,13 @@ against the path policy.
 
 Rules:
 
-- Relative paths are resolved against `working_dir`.
+- The wrapper asks git for `rev-parse --show-toplevel` and treats changed files from
+  `git status` as git-root-relative when that root is available.
+- Relative policy paths are tried both relative to `working_dir` and relative to the
+  git root.
+- Multi-component relative policy paths may also match as a git-relative suffix. This
+  supports Unity subdirectory layouts where git reports
+  `CFantacy-TurnBasedStrategy/Assets/...` but the caller allowed `Assets/...`.
 - Absolute paths are allowed.
 - `\` and `/` are normalized.
 - Windows matching is case-insensitive.
@@ -551,6 +591,20 @@ matches `forbidden_paths`, the result includes `policy_violation=true` and lists
 
 Policy violations are report-only. The wrapper does not revert, delete, or otherwise
 modify files.
+
+The `path_policy` result includes bounded diagnostics to make false positives easier
+to inspect:
+
+- `working_dir`
+- `git_root` / `git_root_error`
+- `allowed_paths_normalized`
+- `forbidden_paths_normalized`
+- `checked_files_basis`
+- `file_matches`
+- `match_rule`
+
+If git root detection fails, the wrapper keeps the previous working-dir-relative
+fallback and records the reason in `path_policy.git_root_error`.
 
 ## Status Values
 
@@ -571,10 +625,12 @@ The wrapper still returns legacy fields:
 - `output`
 - `return_code`
 
-New callers should prefer `status`, `exit_code`, `stdout_tail`, and `stderr_tail`.
-Tail fields are bounded by line and character limits to keep MCP responses compact.
-For polling loops, prefer `stdout_cursor` / `stderr_cursor` with delta fields over
-re-reading the full tail each time.
+New callers should prefer `status`, `exit_code`, `stdout_cursor` /
+`stderr_cursor`, and delta fields.
+For polling loops, prefer compact `opencode_coder_status` responses with
+`stdout_cursor` / `stderr_cursor` and delta fields. Tail fields are bounded by line
+and character limits, but status does not include them unless `include_tail=true`.
+Legacy `output` is also omitted from status unless `include_output=true`.
 
 ## Integration Smoke Test
 

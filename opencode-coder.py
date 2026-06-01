@@ -25,6 +25,7 @@ mcp = FastMCP("opencode-coder")
 
 TAIL_LINES = 120
 MAX_TAIL_CHARS = 12_000
+DEFAULT_STATUS_TAIL_MAX_CHARS = 4_000
 MAX_DELTA_BUFFER_CHARS = 64_000
 DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_MAX_MCP_WAIT_SECONDS = 110.0
@@ -34,6 +35,8 @@ DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 MAX_FINISHED_JOBS = 100
 DEFAULT_DIFF_MAX_CHARS = 20_000
 MAX_DIFF_CHARS = 200_000
+MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES = 50
+MAX_PATH_POLICY_DIAGNOSTIC_CHARS = 300
 ACTIVE_STATUSES = {"starting", "running", "timed_out"}
 VALID_WAIT_POLICIES = {"completion", "start_only", "first_output", "first_change"}
 SERVER_REGISTRY_VERSION = 1
@@ -52,6 +55,8 @@ class GitStatusSnapshot:
     files: list[str] = field(default_factory=list)
     fingerprints: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    git_root: str | None = None
+    git_root_error: str | None = None
 
 
 @dataclass
@@ -97,6 +102,9 @@ class OpenCodeJob:
     forbidden_changed_files: list[str] = field(default_factory=list)
     git_status_available: bool = False
     git_status_error: str | None = None
+    git_root: str | None = None
+    git_root_error: str | None = None
+    path_policy_diagnostics: dict = field(default_factory=dict)
     first_output_at: str | None = None
     first_change_at: str | None = None
     last_activity_at: str | None = None
@@ -335,6 +343,14 @@ def clamp_diff_max_chars(max_chars) -> int:
     except (TypeError, ValueError):
         return DEFAULT_DIFF_MAX_CHARS
     return min(max(parsed, 0), MAX_DIFF_CHARS)
+
+
+def clamp_tail_max_chars(tail_max_chars, *, default: int = MAX_TAIL_CHARS) -> int:
+    try:
+        parsed = int(tail_max_chars)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, 0), MAX_TAIL_CHARS)
 
 
 def get_server_registry_path() -> str:
@@ -625,30 +641,193 @@ def sort_paths(paths: list[str]) -> list[str]:
     return sorted(paths, key=lambda item: item.casefold())
 
 
-def normalize_abs_path_key(working_dir: str, path: str) -> str:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path(working_dir) / candidate
-    resolved = candidate.resolve(strict=False)
+def normalize_abs_path_key_from_path(path: Path) -> str:
+    resolved = path.expanduser().resolve(strict=False)
     normalized = os.path.normcase(os.path.realpath(str(resolved)))
     return normalized.rstrip("\\/")
 
 
-def path_matches_policy(working_dir: str, changed_file: str, policy_path: str) -> bool:
-    changed_key = normalize_abs_path_key(working_dir, changed_file)
-    policy_key = normalize_abs_path_key(working_dir, policy_path)
-    if changed_key == policy_key:
+def normalize_abs_path_key(working_dir: str, path: str) -> str:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(working_dir) / candidate
+    return normalize_abs_path_key_from_path(candidate)
+
+
+def path_key_matches(child_key: str, parent_key: str) -> bool:
+    if not parent_key:
+        return False
+    if child_key == parent_key:
         return True
-    separator = os.sep
-    return changed_key.startswith(policy_key + separator)
+    return child_key.startswith(parent_key + os.sep)
+
+
+def trim_diagnostic_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= MAX_PATH_POLICY_DIAGNOSTIC_CHARS:
+        return text
+    return text[: MAX_PATH_POLICY_DIAGNOSTIC_CHARS - 3] + "..."
+
+
+def is_suffix_policy_candidate(policy_path: str) -> bool:
+    candidate = Path(policy_path).expanduser()
+    if candidate.is_absolute():
+        return False
+    normalized = normalize_git_path(policy_path)
+    if not normalized:
+        return False
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) < 2:
+        return False
+    return not any(part == ".." for part in parts)
+
+
+def path_policy_candidates(working_dir: str, git_root: str | None, policy_path: str) -> list[dict]:
+    policy_text = str(policy_path).strip()
+    if not policy_text:
+        return []
+
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_candidate(basis: str, display_path: str, key: str | None = None, relative_path: str | None = None) -> None:
+        marker = key or relative_path or display_path
+        dedupe_key = (basis, marker.casefold() if os.name == "nt" else marker)
+        if dedupe_key in seen:
+            return
+        seen.add(dedupe_key)
+        candidates.append(
+            {
+                "basis": basis,
+                "path": trim_diagnostic_text(display_path),
+                "key": key,
+                "relative_path": relative_path,
+            }
+        )
+
+    expanded = Path(policy_text).expanduser()
+    if expanded.is_absolute():
+        add_candidate("absolute", str(expanded.resolve(strict=False)), normalize_abs_path_key_from_path(expanded))
+        return candidates
+
+    working_candidate = Path(working_dir) / expanded
+    add_candidate(
+        "working_dir",
+        str(working_candidate.resolve(strict=False)),
+        normalize_abs_path_key_from_path(working_candidate),
+    )
+    if git_root:
+        git_candidate = Path(git_root) / expanded
+        add_candidate(
+            "git_root",
+            str(git_candidate.resolve(strict=False)),
+            normalize_abs_path_key_from_path(git_candidate),
+        )
+    if is_suffix_policy_candidate(policy_text):
+        normalized = normalize_git_path(policy_text)
+        add_candidate("git_relative_suffix", f"*/{normalized}", relative_path=normalized)
+    return candidates
+
+
+def public_policy_candidates(candidates: list[dict]) -> list[dict]:
+    return [
+        {
+            "basis": candidate["basis"],
+            "path": candidate["path"],
+        }
+        for candidate in candidates
+    ]
+
+
+def path_policy_match(
+    working_dir: str,
+    git_root: str | None,
+    changed_file: str,
+    policy_path: str,
+) -> dict | None:
+    changed_base = git_root or working_dir
+    changed_key = normalize_abs_path_key(changed_base, changed_file)
+    changed_git_key = git_path_key(changed_file)
+
+    for candidate in path_policy_candidates(working_dir, git_root, policy_path):
+        if candidate["basis"] == "git_relative_suffix":
+            suffix_key = git_path_key(candidate["relative_path"] or "")
+            changed_with_bounds = f"/{changed_git_key}/"
+            suffix_with_bounds = f"/{suffix_key}/"
+            if suffix_key and (
+                changed_git_key == suffix_key
+                or changed_git_key.startswith(f"{suffix_key}/")
+                or changed_git_key.endswith(f"/{suffix_key}")
+                or suffix_with_bounds in changed_with_bounds
+            ):
+                return {
+                    "input": trim_diagnostic_text(str(policy_path)),
+                    "basis": candidate["basis"],
+                    "path": candidate["path"],
+                }
+            continue
+
+        key = candidate.get("key")
+        if key and path_key_matches(changed_key, key):
+            return {
+                "input": trim_diagnostic_text(str(policy_path)),
+                "basis": candidate["basis"],
+                "path": candidate["path"],
+            }
+    return None
+
+
+def first_path_policy_match(
+    working_dir: str,
+    git_root: str | None,
+    changed_file: str,
+    policy_paths: list[str],
+) -> dict | None:
+    for policy_path in policy_paths:
+        match = path_policy_match(working_dir, git_root, changed_file, policy_path)
+        if match is not None:
+            return match
+    return None
+
+
+def normalize_policy_paths_for_diagnostics(
+    working_dir: str,
+    git_root: str | None,
+    policy_paths: list[str],
+) -> list[dict]:
+    diagnostics: list[dict] = []
+    for policy_path in policy_paths[:MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES]:
+        diagnostics.append(
+            {
+                "input": trim_diagnostic_text(str(policy_path)),
+                "candidates": public_policy_candidates(path_policy_candidates(working_dir, git_root, policy_path)),
+            }
+        )
+    return diagnostics
 
 
 def get_path_policy_summary(job: OpenCodeJob) -> dict:
+    diagnostics = dict(job.path_policy_diagnostics or {})
     return {
         "allowed_paths": list(job.allowed_paths) if job.allowed_paths is not None else None,
         "forbidden_paths": list(job.forbidden_paths) if job.forbidden_paths is not None else None,
         "checked_files_basis": "new_changed_files",
-        "match_rule": "same path or descendant path; relative paths resolve against working_dir",
+        "working_dir": diagnostics.get("working_dir", trim_diagnostic_text(job.working_dir)),
+        "git_root": diagnostics.get("git_root", trim_diagnostic_text(job.git_root)),
+        "git_root_error": diagnostics.get("git_root_error", trim_diagnostic_text(job.git_root_error)),
+        "allowed_paths_normalized": diagnostics.get("allowed_paths_normalized", []),
+        "forbidden_paths_normalized": diagnostics.get("forbidden_paths_normalized", []),
+        "checked_files_count": diagnostics.get("checked_files_count", 0),
+        "file_matches": diagnostics.get("file_matches", []),
+        "file_matches_truncated": diagnostics.get("file_matches_truncated", False),
+        "match_rule": (
+            "forbidden paths are checked first; exact path or descendant path matches; "
+            "git status paths are treated as git-root-relative when git_root is available; "
+            "relative policy paths are tried relative to working_dir and git_root; "
+            "multi-component relative policy paths may also match a git-relative suffix"
+        ),
         "case_sensitive": os.name != "nt",
     }
 
@@ -661,14 +840,18 @@ def summarize_command(cmd: list[str], prompt: str) -> str:
     return " ".join(display)
 
 
-def trim_tail(text: str) -> str:
-    if len(text) <= MAX_TAIL_CHARS:
+def trim_tail_chars(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
         return text
-    return text[-MAX_TAIL_CHARS:]
+    return text[-max_chars:]
 
 
-def tail_to_text(lines: deque[str]) -> str:
-    return trim_tail("".join(lines))
+def trim_tail(text: str) -> str:
+    return trim_tail_chars(text, MAX_TAIL_CHARS)
+
+
+def tail_to_text(lines: deque[str], max_chars: int = MAX_TAIL_CHARS) -> str:
+    return trim_tail_chars("".join(lines), max_chars)
 
 
 def parse_output_cursor(cursor) -> int | None:
@@ -1067,8 +1250,8 @@ def parse_git_status_entries(stdout: str) -> dict[str, tuple[str, str]]:
     return entries
 
 
-def file_fingerprint(working_dir: str, path: str, status_code: str) -> str:
-    absolute_path = Path(working_dir) / path
+def file_fingerprint(base_dir: str, path: str, status_code: str) -> str:
+    absolute_path = Path(base_dir) / path
     try:
         stat_result = absolute_path.lstat()
     except OSError:
@@ -1097,18 +1280,44 @@ def file_fingerprint(working_dir: str, path: str, status_code: str) -> str:
     return f"{status_code}|other|{stat_result.st_mode}|{stat_result.st_size}|{stat_result.st_mtime_ns}"
 
 
-def build_git_status_snapshot(working_dir: str, stdout: str) -> GitStatusSnapshot:
+def build_git_status_snapshot(base_dir: str, stdout: str, *, git_root: str | None = None, git_root_error: str | None = None) -> GitStatusSnapshot:
     entries = parse_git_status_entries(stdout)
     files_by_key = {key: path for key, (path, _status_code) in entries.items()}
     fingerprints = {
-        key: file_fingerprint(working_dir, path, status_code)
+        key: file_fingerprint(base_dir, path, status_code)
         for key, (path, status_code) in entries.items()
     }
     return GitStatusSnapshot(
         available=True,
         files=sort_paths(list(files_by_key.values())),
         fingerprints=fingerprints,
+        git_root=git_root,
+        git_root_error=git_root_error,
     )
+
+
+def collect_git_root(working_dir: str) -> tuple[str | None, str | None]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", working_dir, "rev-parse", "--show-toplevel"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except Exception as exc:
+        return None, str(exc)
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "git rev-parse failed").strip()
+        return None, trim_tail(error)
+
+    git_root = result.stdout.strip()
+    if not git_root:
+        return None, "git rev-parse returned an empty git root"
+    return str(Path(git_root).resolve(strict=False)), None
 
 
 def collect_git_status(working_dir: str) -> GitStatusSnapshot:
@@ -1138,10 +1347,17 @@ def collect_git_status(working_dir: str) -> GitStatusSnapshot:
         error = (result.stderr or result.stdout or "git status failed").strip()
         return GitStatusSnapshot(available=False, error=trim_tail(error))
 
-    return build_git_status_snapshot(working_dir, result.stdout)
+    git_root, git_root_error = collect_git_root(working_dir)
+    base_dir = git_root or working_dir
+    return build_git_status_snapshot(
+        base_dir,
+        result.stdout,
+        git_root=git_root,
+        git_root_error=git_root_error,
+    )
 
 
-def collect_git_status_entry_map(working_dir: str) -> tuple[dict[str, tuple[str, str]], str | None]:
+def collect_git_status_entry_map(working_dir: str) -> tuple[dict[str, tuple[str, str]], str | None, str | None, str | None]:
     try:
         result = subprocess.run(
             [
@@ -1162,13 +1378,14 @@ def collect_git_status_entry_map(working_dir: str) -> tuple[dict[str, tuple[str,
             timeout=5,
         )
     except Exception as exc:
-        return {}, str(exc)
+        return {}, str(exc), None, None
 
     if result.returncode != 0:
         error = (result.stderr or result.stdout or "git status failed").strip()
-        return {}, trim_tail(error)
+        return {}, trim_tail(error), None, None
 
-    return parse_git_status_entries(result.stdout), None
+    git_root, git_root_error = collect_git_root(working_dir)
+    return parse_git_status_entries(result.stdout), None, git_root, git_root_error
 
 
 def run_git_diff(working_dir: str, paths: list[str], *, cached: bool = False) -> tuple[str, str | None]:
@@ -1204,8 +1421,8 @@ def run_git_diff(working_dir: str, paths: list[str], *, cached: bool = False) ->
     return result.stdout, None
 
 
-def make_untracked_file_diff(working_dir: str, path: str) -> tuple[str, str | None]:
-    absolute_path = Path(working_dir) / path
+def make_untracked_file_diff(base_dir: str, path: str) -> tuple[str, str | None]:
+    absolute_path = Path(base_dir) / path
     if not absolute_path.is_file():
         return "", "not_a_regular_file"
     try:
@@ -1214,7 +1431,9 @@ def make_untracked_file_diff(working_dir: str, path: str) -> tuple[str, str | No
     except OSError as exc:
         return "", str(exc)
     if len(data) > MAX_DIFF_CHARS:
-        data = data[:MAX_DIFF_CHARS]
+        return "", "file_too_large"
+    if b"\x00" in data:
+        return "", "binary_file"
 
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines(keepends=True)
@@ -1237,25 +1456,54 @@ def truncate_diff(diff: str, max_chars: int) -> tuple[str, bool]:
 
 def evaluate_path_policy(
     working_dir: str,
+    git_root: str | None,
+    git_root_error: str | None,
     new_changed_files: list[str],
     allowed_paths: list[str] | None,
     forbidden_paths: list[str] | None,
-) -> tuple[bool, list[str], list[str]]:
+) -> tuple[bool, list[str], list[str], dict]:
     allowed = [path for path in list(allowed_paths or []) if str(path).strip()]
     forbidden = [path for path in list(forbidden_paths or []) if str(path).strip()]
     forbidden_changed_files: list[str] = []
     extra_changed_files: list[str] = []
+    file_matches: list[dict] = []
 
     for changed_file in new_changed_files:
-        if any(path_matches_policy(working_dir, changed_file, forbidden_path) for forbidden_path in forbidden):
-            forbidden_changed_files.append(changed_file)
-            continue
+        forbidden_match = first_path_policy_match(working_dir, git_root, changed_file, forbidden)
+        allowed_match = first_path_policy_match(working_dir, git_root, changed_file, allowed)
 
-        if allowed and not any(path_matches_policy(working_dir, changed_file, allowed_path) for allowed_path in allowed):
+        if forbidden_match is not None:
+            forbidden_changed_files.append(changed_file)
+            verdict = "forbidden"
+        elif allowed and allowed_match is None:
             extra_changed_files.append(changed_file)
+            verdict = "extra"
+        else:
+            verdict = "allowed"
+
+        if len(file_matches) < MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES:
+            file_matches.append(
+                {
+                    "file": trim_diagnostic_text(changed_file),
+                    "verdict": verdict,
+                    "allowed_by": allowed_match,
+                    "forbidden_by": forbidden_match,
+                }
+            )
 
     policy_violation = bool(forbidden_changed_files or extra_changed_files)
-    return policy_violation, extra_changed_files, forbidden_changed_files
+    diagnostics = {
+        "working_dir": trim_diagnostic_text(working_dir),
+        "git_root": trim_diagnostic_text(git_root),
+        "git_root_error": trim_diagnostic_text(git_root_error),
+        "checked_files_basis": "new_changed_files",
+        "checked_files_count": len(new_changed_files),
+        "allowed_paths_normalized": normalize_policy_paths_for_diagnostics(working_dir, git_root, allowed),
+        "forbidden_paths_normalized": normalize_policy_paths_for_diagnostics(working_dir, git_root, forbidden),
+        "file_matches": file_matches,
+        "file_matches_truncated": len(new_changed_files) > MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES,
+    }
+    return policy_violation, extra_changed_files, forbidden_changed_files, diagnostics
 
 
 def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_preexisting: bool = False) -> None:
@@ -1284,8 +1532,10 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
             for key in changed_during_job_keys
         }
         previous_change_fingerprints = dict(job.observed_change_fingerprints)
-        policy_violation, extra_changed_files, forbidden_changed_files = evaluate_path_policy(
+        policy_violation, extra_changed_files, forbidden_changed_files, path_policy_diagnostics = evaluate_path_policy(
             job.working_dir,
+            snapshot.git_root,
+            snapshot.git_root_error,
             new_changed_files,
             job.allowed_paths,
             job.forbidden_paths,
@@ -1307,6 +1557,9 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
         job.forbidden_changed_files = forbidden_changed_files
         job.git_status_available = snapshot.available
         job.git_status_error = snapshot.error
+        job.git_root = snapshot.git_root
+        job.git_root_error = snapshot.git_root_error
+        job.path_policy_diagnostics = path_policy_diagnostics
 
 
 def refresh_job_snapshot(job: OpenCodeJob) -> None:
@@ -1468,13 +1721,19 @@ def job_to_result(
     summary_override: str | None = None,
     stdout_cursor: int | None = None,
     stderr_cursor: int | None = None,
+    include_tail: bool = True,
+    include_output: bool = True,
+    tail_max_chars: int | None = None,
 ) -> dict:
     if is_job_active(job):
         refresh_job_snapshot(job)
 
+    effective_tail_max_chars = clamp_tail_max_chars(tail_max_chars)
     with job.lock:
-        stdout_tail = tail_to_text(job.stdout_tail)
-        stderr_tail = tail_to_text(job.stderr_tail)
+        full_stdout_tail = tail_to_text(job.stdout_tail, effective_tail_max_chars)
+        full_stderr_tail = tail_to_text(job.stderr_tail, effective_tail_max_chars)
+        stdout_tail = full_stdout_tail if include_tail else ""
+        stderr_tail = full_stderr_tail if include_tail else ""
         stdout_delta, current_stdout_cursor, stdout_delta_truncated = output_delta_locked(
             job,
             "stdout",
@@ -1486,7 +1745,9 @@ def job_to_result(
             stderr_cursor,
         )
         process_running = job.process is not None and job.process.poll() is None
-        output = trim_tail((stdout_tail + "\n" + stderr_tail).strip())
+        output = ""
+        if include_output:
+            output = trim_tail_chars((full_stdout_tail + "\n" + full_stderr_tail).strip(), effective_tail_max_chars)
         status = job.status
         success = status == "completed" and job.exit_code == 0
         summary = summary_override or job.summary
@@ -2200,8 +2461,11 @@ def opencode_coder_status(
     wait_seconds: float = 0.0,
     stdout_cursor: int | None = None,
     stderr_cursor: int | None = None,
+    include_tail: bool = False,
+    include_output: bool = False,
+    tail_max_chars: int | None = None,
 ) -> dict:
-    """通过 job_id 查询 opencode_coder 后台任务状态和输出尾部。"""
+    """通过 job_id 查询 opencode_coder 后台任务状态；默认返回 compact 结果。"""
     cleanup_jobs()
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)
@@ -2218,6 +2482,9 @@ def opencode_coder_status(
         new_job_started=False,
         stdout_cursor=stdout_cursor,
         stderr_cursor=stderr_cursor,
+        include_tail=bool(include_tail),
+        include_output=bool(include_output),
+        tail_max_chars=clamp_tail_max_chars(tail_max_chars, default=DEFAULT_STATUS_TAIL_MAX_CHARS),
     )
 
 
@@ -2237,6 +2504,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "new_changed_files": [],
             "preexisting_changed_files": [],
             "diff": "",
+            "diff_empty_reason": "job_not_found",
+            "diff_source_files": [],
+            "diff_command_errors": [],
             "diff_truncated": False,
             "max_chars": effective_max_chars,
             "undiffed_files": [],
@@ -2256,6 +2526,8 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
         preexisting_changed_files = list(job.preexisting_changed_files)
         git_status_available = job.git_status_available
         git_status_error = job.git_status_error
+        job_git_root = job.git_root
+        job_git_root_error = job.git_root_error
 
     if not git_status_available:
         return {
@@ -2265,6 +2537,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "new_changed_files": new_changed_files,
             "preexisting_changed_files": preexisting_changed_files,
             "diff": "",
+            "diff_empty_reason": "git_status_unavailable",
+            "diff_source_files": [],
+            "diff_command_errors": [git_status_error or "git_status_unavailable"],
             "diff_truncated": False,
             "max_chars": effective_max_chars,
             "undiffed_files": list(new_changed_files),
@@ -2274,7 +2549,7 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "success": False,
         }
 
-    status_entries, status_error = collect_git_status_entry_map(working_dir)
+    status_entries, status_error, status_git_root, status_git_root_error = collect_git_status_entry_map(working_dir)
     if status_error is not None:
         return {
             "job_id": job_id,
@@ -2283,6 +2558,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "new_changed_files": new_changed_files,
             "preexisting_changed_files": preexisting_changed_files,
             "diff": "",
+            "diff_empty_reason": "git_status_error",
+            "diff_source_files": [],
+            "diff_command_errors": [status_error],
             "diff_truncated": False,
             "max_chars": effective_max_chars,
             "undiffed_files": list(new_changed_files),
@@ -2292,6 +2570,9 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             "success": False,
         }
 
+    git_root = status_git_root or job_git_root
+    git_root_error = status_git_root_error or job_git_root_error
+    diff_base_dir = git_root or working_dir
     preexisting_keys = {git_path_key(path) for path in preexisting_changed_files}
     includes_preexisting_dirty_changes = any(
         git_path_key(path) in preexisting_keys
@@ -2308,17 +2589,21 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
             tracked_paths.append(path)
 
     diff_parts: list[str] = []
+    diff_source_files: list[str] = []
     undiffed_files: list[str] = []
     errors: list[str] = []
+    if git_root_error and not git_root:
+        errors.append(f"git root unavailable: {git_root_error}")
 
-    unstaged_diff, unstaged_error = run_git_diff(working_dir, tracked_paths, cached=False)
+    unstaged_diff, unstaged_error = run_git_diff(diff_base_dir, tracked_paths, cached=False)
     if unstaged_error:
         errors.append(f"git diff failed: {unstaged_error}")
         undiffed_files.extend(tracked_paths)
     elif unstaged_diff:
         diff_parts.append(unstaged_diff)
+        diff_source_files.extend(tracked_paths)
 
-    cached_diff, cached_error = run_git_diff(working_dir, tracked_paths, cached=True)
+    cached_diff, cached_error = run_git_diff(diff_base_dir, tracked_paths, cached=True)
     if cached_error:
         errors.append(f"git diff --cached failed: {cached_error}")
         for path in tracked_paths:
@@ -2326,18 +2611,34 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
                 undiffed_files.append(path)
     elif cached_diff:
         diff_parts.append(cached_diff)
+        diff_source_files.extend(tracked_paths)
 
     for path in untracked_paths:
-        untracked_diff, untracked_error = make_untracked_file_diff(working_dir, path)
+        untracked_diff, untracked_error = make_untracked_file_diff(diff_base_dir, path)
         if untracked_error:
             undiffed_files.append(path)
             errors.append(f"{path}: {untracked_error}")
         elif untracked_diff:
             diff_parts.append(untracked_diff)
+            diff_source_files.append(path)
 
     full_diff = "\n".join(part.rstrip("\n") for part in diff_parts if part)
     diff, diff_truncated = truncate_diff(full_diff, effective_max_chars)
     undiffed_files = unique_sorted_paths(undiffed_files)
+    diff_source_files = unique_sorted_paths(diff_source_files)
+    diff_empty_reason = None
+    if not full_diff:
+        if not new_changed_files:
+            diff_empty_reason = "no_new_changed_files"
+        elif errors:
+            diff_empty_reason = "diff_generation_errors"
+        elif undiffed_files:
+            diff_empty_reason = "job_files_undiffed"
+        else:
+            diff_empty_reason = "current_worktree_has_no_diff_for_job_files"
+
+    success = not errors and (bool(full_diff) or not new_changed_files)
+    error_text = "; ".join(errors) or (diff_empty_reason if not success else None)
     return {
         "job_id": job_id,
         "status": status,
@@ -2345,13 +2646,16 @@ def opencode_coder_diff(job_id: str, max_chars: int = DEFAULT_DIFF_MAX_CHARS) ->
         "new_changed_files": new_changed_files,
         "preexisting_changed_files": preexisting_changed_files,
         "diff": diff,
+        "diff_empty_reason": diff_empty_reason,
+        "diff_source_files": diff_source_files,
+        "diff_command_errors": list(errors),
         "diff_truncated": diff_truncated,
         "max_chars": effective_max_chars,
         "undiffed_files": undiffed_files,
         "includes_preexisting_dirty_changes": includes_preexisting_dirty_changes,
         "git_status_available": True,
-        "error": "; ".join(errors) or None,
-        "success": not errors,
+        "error": error_text,
+        "success": success,
     }
 
 

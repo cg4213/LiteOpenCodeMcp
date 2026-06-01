@@ -202,10 +202,13 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `wait_seconds`：可选短等待，限制在 `0..30` 秒，默认 `0`。
 - `stdout_cursor`：可选，前一次结果返回的 stdout cursor。
 - `stderr_cursor`：可选，前一次结果返回的 stderr cursor。
+- `include_tail`：可选调试开关，默认 `false`，因此轮询不会反复返回 `stdout_tail` / `stderr_tail`。
+- `include_output`：可选兼容/调试开关，默认 `false`，因此轮询不会反复返回旧字段 `output`。
+- `tail_max_chars`：启用 tail/output 时的字符上限，会被包装层限制到安全范围内。
 
 当 `wait_seconds > 0` 时，status 会等待到以下任一情况发生：job 完成、新 stdout/stderr 到达、新文件变更被检测到、等待超时。status 查询不会启动新的 OpenCode 进程。
 
-如果传入 cursor，返回中会包含 `stdout_delta` / `stderr_delta`，只返回 cursor 之后的新增文本。cursor 是包装层内存缓冲区中的字符偏移，不是持久化日志文件偏移。
+默认 status 是 compact 响应：`stdout_tail`、`stderr_tail` 和 `output` 字段仍保留，但内容为空。如果传入 cursor，返回中会包含 `stdout_delta` / `stderr_delta`，只返回 cursor 之后的新增文本。cursor 是包装层内存缓冲区中的字符偏移，不是持久化日志文件偏移。只有调试输出时才建议传 `include_tail=true`，输出可能较大时同时传 `tail_max_chars`。
 
 相关字段：
 
@@ -238,6 +241,17 @@ print(next_status["stdout_delta"])
 print(next_status["stderr_delta"])
 ```
 
+需要查看 tail 时显式开启：
+
+```python
+debug_status = opencode_coder_status(
+    job_id,
+    include_tail=True,
+    include_output=True,
+    tail_max_chars=4000,
+)
+```
+
 ### `opencode_coder_diff`
 
 基于某个 `opencode_coder` job 的 `new_changed_files` 返回有界 git diff，方便 review。
@@ -266,6 +280,9 @@ opencode_coder_diff(job_id, max_chars=20000)
 - `new_changed_files`
 - `preexisting_changed_files`
 - `diff`
+- `diff_empty_reason`
+- `diff_source_files`
+- `diff_command_errors`
 - `diff_truncated`
 - `max_chars`
 - `undiffed_files`
@@ -273,6 +290,10 @@ opencode_coder_diff(job_id, max_chars=20000)
 - `git_status_available`
 - `error`
 - `success`
+
+`success=true` 表示包装层生成了可用 diff，或本 job 没有 `new_changed_files`。如果 `new_changed_files` 非空但当前工作区对这些文件已经没有可展示 diff，例如 job 期间改过又还原，工具会返回 `success=false`，并通过 `diff_empty_reason` 说明原因，如 `current_worktree_has_no_diff_for_job_files`。无法渲染为文本 diff 的文件，例如 untracked 二进制文件、过大文件、非普通文件，会进入 `undiffed_files`，原因记录在有界的 `diff_command_errors` 中。
+
+`opencode_coder_diff` 是 review aid，不是唯一审查来源。当 `success=false`、`diff_empty_reason` 非空、`diff_command_errors` 非空或 `undiffed_files` 非空时，应回退到本地 `git status` / `git diff` 复核。
 
 注意：这是 review 辅助，不保证是“只包含本 job 的纯 patch”。如果某个文件在 job 开始前已经 dirty，且本 job 又修改了它，git diff 可能混入任务前已有改动；此时返回 `includes_preexisting_dirty_changes=true`。
 
@@ -440,7 +461,9 @@ git -C <working_dir> -c core.quotepath=false status --porcelain=v1 --untracked-f
 
 规则：
 
-- 相对路径基于 `working_dir` 解析。
+- 包装层会通过 `git rev-parse --show-toplevel` 获取 git root；如果可用，`git status` 返回的 changed file 会按 git-root-relative 路径解释。
+- 相对 policy path 会同时按 `working_dir` 和 git root 解析。
+- 多段相对 policy path 还可以按 git-relative suffix 匹配。这个规则用于支持 Unity 子目录布局，例如 git 报告 `CFantacy-TurnBasedStrategy/Assets/...`，而调用方传入 `Assets/...`。
 - 支持绝对路径。
 - `\` 和 `/` 会规范化。
 - Windows 下大小写不敏感。
@@ -453,6 +476,18 @@ git -C <working_dir> -c core.quotepath=false status --porcelain=v1 --untracked-f
 - 新改动文件命中 `forbidden_paths` 时，返回 `policy_violation=true` 并列入 `forbidden_changed_files`。
 
 路径策略只报告，不自动回滚、删除或修改文件。
+
+`path_policy` 会返回有界诊断字段，方便排查误报：
+
+- `working_dir`
+- `git_root` / `git_root_error`
+- `allowed_paths_normalized`
+- `forbidden_paths_normalized`
+- `checked_files_basis`
+- `file_matches`
+- `match_rule`
+
+如果 git root 不可用，包装层会保留原有的 working-dir-relative fallback，并在 `path_policy.git_root_error` 说明原因。
 
 ## 状态值
 
@@ -473,7 +508,7 @@ git -C <working_dir> -c core.quotepath=false status --porcelain=v1 --untracked-f
 - `output`
 - `return_code`
 
-新调用方建议优先使用 `status`、`exit_code`、`stdout_tail`、`stderr_tail`。轮询场景建议使用 `stdout_cursor` / `stderr_cursor` 和 delta 字段，避免重复传输完整 tail。
+新调用方建议优先使用 `status`、`exit_code`、`stdout_cursor` / `stderr_cursor` 和 delta 字段。轮询场景默认使用 compact status，避免重复传输完整 tail。只有需要调试时才传 `include_tail=true`；旧字段 `output` 也只有传 `include_output=true` 时才会在 status 中返回内容。
 
 ## 真实 OpenCode Smoke Test
 

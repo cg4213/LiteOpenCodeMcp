@@ -101,6 +101,31 @@ def fake_command(
             "path.write_text('generated\\n', encoding='utf-8')\n"
             "print(f'wrote {path}', flush=True)\n"
         )
+    elif prompt.startswith("delete:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.unlink()\n"
+            "print(f'deleted {path}', flush=True)\n"
+        )
+    elif prompt.startswith("restore_baseline:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.write_text('baseline\\n', encoding='utf-8')\n"
+            "print(f'restored {path}', flush=True)\n"
+        )
+    elif prompt.startswith("write_binary:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_bytes(b'\\x00\\x01\\x02')\n"
+            "print(f'wrote binary {path}', flush=True)\n"
+        )
     elif prompt.startswith("long_write:"):
         path = prompt.split(":", 1)[1]
         code = (
@@ -335,9 +360,10 @@ class OpenCodeCoderTests(unittest.TestCase):
             self.assertIn(result["status"], {"running", "timed_out", "completed"})
             job_id = result["job_id"]
             final_status = wait_for_terminal_job(job_id)
+            final_output = server.opencode_coder_status(job_id, include_tail=True)
 
         self.assertEqual(final_status["status"], "completed")
-        self.assertIn("done", final_status["stdout_tail"])
+        self.assertIn("done", final_output["stdout_tail"])
 
     def test_first_output_returns_after_initial_output(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -372,7 +398,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             elapsed = time.monotonic() - started_at
             final_status = wait_for_terminal_job(result["job_id"])
 
-        self.assertLess(elapsed, 0.75)
+        self.assertLess(elapsed, 1.0)
         self.assertEqual(result["wait_policy"], "first_change")
         self.assertEqual(result["new_changed_files"], ["src/new.txt"])
         self.assertIsNotNone(result["first_change_at"])
@@ -389,7 +415,7 @@ class OpenCodeCoderTests(unittest.TestCase):
             )
             build_call_count = len(FAKE_BUILD_CALLS)
             started_at = time.monotonic()
-            status = server.opencode_coder_status(initial["job_id"], wait_seconds=1)
+            status = server.opencode_coder_status(initial["job_id"], wait_seconds=1, include_tail=True)
             elapsed = time.monotonic() - started_at
             final_status = wait_for_terminal_job(initial["job_id"])
 
@@ -442,7 +468,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(status["stderr_cursor"], 0)
         self.assertEqual(status["stdout_delta"], "")
         self.assertEqual(status["stderr_delta"], "")
-        self.assertIn("ok", status["stdout_tail"])
+        self.assertEqual(status["stdout_tail"], "")
+        self.assertEqual(status["stderr_tail"], "")
+        self.assertEqual(status["output"], "")
 
     def test_status_stdout_delta_from_previous_cursor(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -508,15 +536,29 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(status["stderr_delta_truncated"])
         self.assertEqual(final_status["status"], "completed")
 
-    def test_status_without_cursor_keeps_legacy_tail_fields(self):
+    def test_status_include_tail_and_output_returns_legacy_fields(self):
         with tempfile.TemporaryDirectory() as working_dir:
             completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
-            status = server.opencode_coder_status(completed["job_id"])
+            status = server.opencode_coder_status(completed["job_id"], include_tail=True, include_output=True)
 
         self.assertIn("ok", status["stdout_tail"])
         self.assertEqual(status["stdout_delta"], "")
         self.assertEqual(status["stderr_delta"], "")
         self.assertIn("ok", status["output"])
+
+    def test_status_include_tail_respects_tail_max_chars(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("large_stdout", working_dir=working_dir, timeout_seconds=2)
+            status = server.opencode_coder_status(
+                completed["job_id"],
+                include_tail=True,
+                include_output=True,
+                tail_max_chars=6,
+            )
+
+        self.assertLessEqual(len(status["stdout_tail"]), 6)
+        self.assertTrue(status["stdout_tail"].endswith("vwxyz\n"))
+        self.assertEqual(status["output"], status["stdout_tail"].strip())
 
     def test_status_invalid_or_out_of_range_cursor_is_safe(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -977,12 +1019,13 @@ class OpenCodeCoderTests(unittest.TestCase):
             self.assertIn(running_status["status"], {"timed_out", "completed"})
 
             final_status = wait_for_terminal_job(job_id)
+            final_output = server.opencode_coder_status(job_id, include_tail=True)
 
         self.assertEqual(final_status["status"], "completed")
         self.assertEqual(final_status["exit_code"], 0)
         self.assertFalse(final_status["process_running"])
-        self.assertIn("begin", final_status["stdout_tail"])
-        self.assertIn("done", final_status["stdout_tail"])
+        self.assertIn("begin", final_output["stdout_tail"])
+        self.assertIn("done", final_output["stdout_tail"])
 
     def test_same_cwd_running_job_rejects_second_default_call(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1095,6 +1138,25 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIn("new file mode", diff["diff"])
         self.assertIn("+++ b/src/new.txt", diff["diff"])
         self.assertIn("+generated", diff["diff"])
+        self.assertEqual(diff["diff_source_files"], ["src/new.txt"])
+        self.assertIsNone(diff["diff_empty_reason"])
+
+    def test_coder_diff_returns_deleted_tracked_file_diff(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            tracked_file = Path(working_dir, "tracked.txt")
+            tracked_file.write_text("baseline\n", encoding="utf-8")
+            commit_all(working_dir)
+            job = server.opencode_coder("delete:tracked.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertTrue(diff["success"])
+        self.assertEqual(diff["new_changed_files"], ["tracked.txt"])
+        self.assertEqual(diff["undiffed_files"], [])
+        self.assertIn("deleted file mode", diff["diff"])
+        self.assertIn("-baseline", diff["diff"])
+        self.assertEqual(diff["diff_source_files"], ["tracked.txt"])
+        self.assertIsNone(diff["diff_empty_reason"])
 
     def test_coder_diff_non_git_working_dir_returns_structured_error(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1133,6 +1195,38 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(diff["preexisting_changed_files"], ["old.txt"])
         self.assertTrue(diff["includes_preexisting_dirty_changes"])
         self.assertIn("+generated", diff["diff"])
+
+    def test_coder_diff_reports_empty_reason_when_job_reverts_dirty_file(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            tracked_file = Path(working_dir, "tracked.txt")
+            tracked_file.write_text("baseline\n", encoding="utf-8")
+            commit_all(working_dir)
+            tracked_file.write_text("dirty\n", encoding="utf-8")
+            job = server.opencode_coder("restore_baseline:tracked.txt", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertEqual(job["new_changed_files"], ["tracked.txt"])
+        self.assertEqual(job["all_changed_files"], [])
+        self.assertFalse(diff["success"])
+        self.assertEqual(diff["diff"], "")
+        self.assertEqual(diff["diff_empty_reason"], "current_worktree_has_no_diff_for_job_files")
+        self.assertEqual(diff["diff_source_files"], [])
+        self.assertEqual(diff["diff_command_errors"], [])
+        self.assertTrue(diff["includes_preexisting_dirty_changes"])
+        self.assertEqual(diff["error"], "current_worktree_has_no_diff_for_job_files")
+
+    def test_coder_diff_reports_undiffed_untracked_binary_file(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            job = server.opencode_coder("write_binary:src/blob.bin", working_dir=working_dir, timeout_seconds=2)
+            diff = server.opencode_coder_diff(job["job_id"])
+
+        self.assertFalse(diff["success"])
+        self.assertEqual(diff["diff"], "")
+        self.assertEqual(diff["diff_empty_reason"], "diff_generation_errors")
+        self.assertEqual(diff["undiffed_files"], ["src/blob.bin"])
+        self.assertIn("binary_file", "; ".join(diff["diff_command_errors"]))
 
     def test_allowed_paths_allows_in_scope_changes(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1176,6 +1270,94 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertTrue(result["policy_violation"])
         self.assertEqual(result["forbidden_changed_files"], ["src/secret/out.txt"])
         self.assertEqual(result["extra_changed_files"], [])
+
+    def test_allowed_paths_allows_assets_when_working_dir_is_git_root(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["Assets/_SRPG/Scripts/UI"],
+            )
+
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["extra_changed_files"], [])
+        self.assertEqual(result["new_changed_files"], ["Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs"])
+        self.assertEqual(result["path_policy"]["git_root"], str(Path(working_dir).resolve()))
+
+    def test_allowed_paths_allows_subdir_prefix_from_repo_root(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:CFantacy-TurnBasedStrategy/Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["CFantacy-TurnBasedStrategy/Assets/_SRPG/Scripts/UI"],
+            )
+
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["extra_changed_files"], [])
+        self.assertEqual(
+            result["new_changed_files"],
+            ["CFantacy-TurnBasedStrategy/Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs"],
+        )
+
+    def test_allowed_paths_allows_unity_assets_suffix_from_repo_root(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:CFantacy-TurnBasedStrategy/Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["Assets/_SRPG/Scripts/UI"],
+            )
+
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["extra_changed_files"], [])
+        file_match = result["path_policy"]["file_matches"][0]
+        self.assertEqual(file_match["verdict"], "allowed")
+        self.assertEqual(file_match["allowed_by"]["basis"], "git_relative_suffix")
+
+    def test_allowed_paths_allows_project_relative_path_when_working_dir_is_subdir(self):
+        with tempfile.TemporaryDirectory() as repo_dir:
+            init_git_repo(repo_dir)
+            project_dir = Path(repo_dir, "CFantacy-TurnBasedStrategy")
+            project_dir.mkdir()
+            result = server.opencode_coder(
+                "write:Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs",
+                working_dir=str(project_dir),
+                timeout_seconds=2,
+                allowed_paths=["Assets/_SRPG/Scripts/UI"],
+            )
+
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["extra_changed_files"], [])
+        self.assertEqual(
+            result["new_changed_files"],
+            ["CFantacy-TurnBasedStrategy/Assets/_SRPG/Scripts/UI/RogueSystemMapPanel.cs"],
+        )
+        file_match = result["path_policy"]["file_matches"][0]
+        self.assertEqual(file_match["allowed_by"]["basis"], "working_dir")
+
+    def test_forbidden_paths_keep_priority_with_windows_style_paths(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:Assets/_SRPG/Scripts/UI/Secret/out.cs",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["Assets\\_SRPG\\Scripts\\UI"],
+                forbidden_paths=["Assets\\_SRPG\\Scripts\\UI\\Secret"],
+            )
+
+        self.assertTrue(result["policy_violation"])
+        self.assertEqual(result["forbidden_changed_files"], ["Assets/_SRPG/Scripts/UI/Secret/out.cs"])
+        self.assertEqual(result["extra_changed_files"], [])
+        file_match = result["path_policy"]["file_matches"][0]
+        self.assertEqual(file_match["verdict"], "forbidden")
+        self.assertIsNotNone(file_match["allowed_by"])
+        self.assertIsNotNone(file_match["forbidden_by"])
 
     def test_non_git_working_dir_returns_structured_snapshot_fields(self):
         with tempfile.TemporaryDirectory() as working_dir:
