@@ -108,7 +108,16 @@ python -B -m unittest -v test_opencode_coder.py
 
 ## 推荐使用方式
 
-长任务推荐使用托管 server 和非阻塞等待：
+推荐把 LiteOpenCodeMcp 当作“任务调度器 + 紧凑 review 面板”，不要当作会持续吐完整终端输出的同步命令。
+
+- 默认复用 `server_id`，不要默认复用 `session_id`。只有明确需要延续 OpenCode 会话上下文时才传 `session_id`、`continue_last` 或 `fork_session`；不要跨不同 `working_dir` 或不同仓库根目录复用 session。
+- 长任务优先使用 `wait_policy="start_only"` 或 `"first_output"`，让主对话尽快拿回控制权，再用 compact status 轮询。
+- 普通轮询不要传 `include_tail`、`include_output`、`include_delta`。这些是调试开关，只有需要看原始 stdout/stderr 或 event 流时才打开，并配合字符上限。
+- 不要只因 `status=completed` 或 `success=true` 就接受结果。完成后必须看 `suggested_action`、`work_summary_text`、变更文件、path policy、stall/risk、`no_event_noop_risk` 和 validation 字段。
+- 如果 `no_event_noop_risk=true`，应不传 `session_id` 重试，或新开 session/server；不要把它当作正常完成。
+- wrapper 不主动运行项目验证，也不会自动回滚半成品。需要结合 `opencode_coder_diff(job_id)`，必要时回退到本地 `git status` / `git diff` 复核。
+
+长任务推荐流程：
 
 1. 用 `opencode_server_start` 启动一个 managed OpenCode server。
 2. 用 `opencode_coder(..., server_id=..., wait_policy="start_only")` 派发任务，尽快拿到 `job_id`。

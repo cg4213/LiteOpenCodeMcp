@@ -113,6 +113,30 @@ Optional environment variables:
 - `OPENCODE_CODER_RUN_INTEGRATION`: set to `1` only when running the real integration
   smoke test.
 
+## Recommended Calling Contract
+
+For normal coding tasks, treat LiteOpenCodeMcp as a job scheduler plus compact review
+surface, not as a raw terminal stream.
+
+- Prefer a managed OpenCode server: discover it with `opencode_server_list`, start one
+  with `opencode_server_start` when needed, then pass `server_id` to `opencode_coder`.
+- Reuse `server_id` by default, not `session_id`. Only pass `session_id`,
+  `continue_last`, or `fork_session` when intentional conversation continuity is
+  required. Do not reuse a session across different `working_dir` or repository roots.
+- Prefer `wait_policy="start_only"` or `"first_output"` for long tasks, then poll with
+  compact `opencode_coder_status(job_id, wait_seconds=...)`.
+- Do not request raw output in the normal polling loop. `include_tail`,
+  `include_output`, and `include_delta` are debug switches and should be paired with
+  explicit character caps when enabled.
+- Treat `completed` / `success=true` as process status only. Before accepting a job,
+  inspect `suggested_action`, `work_summary_text`, changed-file fields, path-policy
+  fields, stall/risk fields, `no_event_noop_risk`, and validation fields.
+- If `no_event_noop_risk=true`, retry without `session_id`, with a fresh session, or
+  with a fresh server; do not accept the result just because the process completed.
+- The wrapper does not run project validation and does not auto-rollback partial edits.
+  Review `opencode_coder_diff(job_id)` and fall back to local `git status` / `git diff`
+  when the diff result is incomplete or surprising.
+
 ## Tools
 
 ### `opencode_coder`
