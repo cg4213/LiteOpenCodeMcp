@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -40,13 +41,34 @@ MAX_PATH_POLICY_DIAGNOSTIC_CHARS = 300
 RECENT_EVENT_LIMIT = 20
 DEFAULT_RECENT_EVENTS_LIMIT = 5
 EVENT_TEXT_PREVIEW_CHARS = 300
+PROGRESS_MESSAGE_MAX_CHARS = 240
+PROGRESS_STARTUP_SECONDS = 3.0
+NO_FIRST_CHANGE_BUDGET_SECONDS = 120.0
+RECENT_FIRST_CHANGE_UPDATE_SECONDS = 30.0
+MAX_LONG_GAP_SEGMENTS = 3
+LONG_GAP_MIN_SECONDS = 60.0
+LONG_GAP_LABEL_MAX_CHARS = 80
+SLOW_FIRST_OUTPUT_SECONDS = NO_FIRST_CHANGE_BUDGET_SECONDS
+SLOW_FIRST_EVENT_SECONDS = NO_FIRST_CHANGE_BUDGET_SECONDS
 STALL_NO_ACTIVITY_SECONDS = 120.0
 STALL_NO_OUTPUT_SECONDS = 120.0
 STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS = 120.0
+SLOW_AFTER_CHANGE_SECONDS = STALL_NO_ACTIVITY_SECONDS
 ACTIVE_STATUSES = {"starting", "running", "timed_out"}
 VALID_WAIT_POLICIES = {"completion", "start_only", "first_output", "first_change"}
 SERVER_REGISTRY_VERSION = 1
 SERVER_REGISTRY_ENV_VAR = "OPENCODE_CODER_REGISTRY_PATH"
+TOOL_ACTIVITY_CATEGORIES = ("read", "edit", "bash", "list", "unity", "other")
+VALIDATION_EXECUTION_TOOL_CATEGORIES = {"bash", "unity"}
+OBSERVED_VALIDATION_TOOL_ORDER = (
+    "unity_skills_debug_force_recompile",
+    "unity_skills_debug_check_compilation",
+    "unity_skills_console_get_logs",
+    "python_unittest",
+    "py_compile",
+    "git_diff_check",
+    "unknown_test_command",
+)
 
 _JOBS: dict[str, "OpenCodeJob"] = {}
 _CWD_ACTIVE_JOBS: dict[str, set[str]] = {}
@@ -126,10 +148,19 @@ class OpenCodeJob:
     git_root_error: str | None = None
     path_policy_diagnostics: dict = field(default_factory=dict)
     first_output_at: str | None = None
+    first_event_at: str | None = None
+    first_tool_at: str | None = None
     first_change_at: str | None = None
+    last_change_at: str | None = None
     last_activity_at: str | None = None
+    last_event_observed_at: str | None = None
     last_git_snapshot_at: str | None = None
     last_trusted_change_activity_at: str | None = None
+    tool_activity_counts: dict[str, int] = field(
+        default_factory=lambda: {category: 0 for category in TOOL_ACTIVITY_CATEGORIES}
+    )
+    observed_validation_tools: list[str] = field(default_factory=list)
+    observed_validation_texts: deque[str] = field(default_factory=lambda: deque(maxlen=RECENT_EVENT_LIMIT))
     output_version: int = 0
     change_version: int = 0
     cancel_requested: bool = False
@@ -1206,6 +1237,206 @@ def summary_has_text_activity(summary: dict) -> bool:
     )
 
 
+def compact_summary_text(summary: dict | None) -> str:
+    if not summary:
+        return ""
+    parts = [
+        summary.get("type"),
+        summary.get("part_type"),
+        summary.get("tool_name"),
+        summary.get("status"),
+        summary.get("reason"),
+        summary.get("text_preview"),
+    ]
+    return " ".join(str(part) for part in parts if part)
+
+
+def classify_tool_activity(tool_name: str | None, summary: dict | None = None) -> str:
+    if tool_name:
+        name_category = classify_tool_name(tool_name)
+        if name_category != "other":
+            return name_category
+
+    text = f"{tool_name or ''} {compact_summary_text(summary)}".lower()
+    if not text.strip():
+        return "other"
+
+    if any(marker in text for marker in ("unity", "debug_force_recompile", "debug_check_compilation", "console_get_logs")):
+        return "unity"
+    if any(marker in text for marker in ("bash", "shell", "terminal", "exec", "command", "powershell", "cmd")):
+        return "bash"
+    if any(marker in text for marker in ("edit", "write", "patch", "apply_patch", "replace", "delete", "move", "rename", "create")):
+        return "edit"
+    if any(marker in text for marker in ("glob", "list", "ls", "directory", "dir", "get-childitem")):
+        return "list"
+    if any(marker in text for marker in ("read", "open", "view", "cat", "grep", "rg", "search", "find")):
+        return "read"
+    return "other"
+
+
+def classify_tool_name(tool_name: str | None) -> str:
+    text = str(tool_name or "").lower().strip()
+    if not text:
+        return "other"
+
+    if any(marker in text for marker in ("unity", "debug_force_recompile", "debug_check_compilation", "console_get_logs")):
+        return "unity"
+    if any(marker in text for marker in ("bash", "shell", "terminal", "exec", "command", "powershell", "cmd", "pytest", "unittest")):
+        return "bash"
+    if any(marker in text for marker in ("glob", "list", "ls", "directory", "dir", "get-childitem")):
+        return "list"
+    if any(marker in text for marker in ("read", "open", "view", "cat", "grep", "rg", "search", "find")):
+        return "read"
+    if any(marker in text for marker in ("edit", "write", "patch", "apply_patch", "replace", "delete", "move", "rename", "create")):
+        return "edit"
+    return "other"
+
+
+def ordered_unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def detect_observed_validation_tools_from_text(text: str) -> list[str]:
+    lowered = text.lower()
+    tools: list[str] = []
+    if "debug_force_recompile" in lowered or "unity_skills_debug_force_recompile" in lowered:
+        tools.append("unity_skills_debug_force_recompile")
+    if (
+        "debug_check_compilation" in lowered
+        or "unity_skills_debug_check_compilation" in lowered
+        or "compile check" in lowered
+        or "compilation check" in lowered
+    ):
+        tools.append("unity_skills_debug_check_compilation")
+    if "console_get_logs" in lowered or "unity_skills_console_get_logs" in lowered:
+        tools.append("unity_skills_console_get_logs")
+    if "py_compile" in lowered:
+        tools.append("py_compile")
+    if "unittest" in lowered or "python -b -m unittest" in lowered or "python -m unittest" in lowered:
+        tools.append("python_unittest")
+    if "git diff --check" in lowered:
+        tools.append("git_diff_check")
+    if any(
+        marker in lowered
+        for marker in (
+            "pytest",
+            "npm test",
+            "dotnet test",
+            "go test",
+            "cargo test",
+            "mvn test",
+            "gradle test",
+            "test command",
+            "running tests",
+            "tests failed",
+            "test failed",
+            "tests passed",
+            "all tests passed",
+            "compilation failed",
+            "compile check passed",
+        )
+    ):
+        tools.append("unknown_test_command")
+    return ordered_unique(tools)
+
+
+def text_has_validation_result_marker(text: str) -> bool:
+    lowered = text.lower()
+    return bool(
+        re.search(r"\b\d+\s+errors?\b", lowered)
+        or re.search(r"\berrors?\s*[:=]\s*\d+\b", lowered)
+        or re.search(r"\berror\s+count\s*[:=]\s*\d+\b", lowered)
+        or any(
+            marker in lowered
+            for marker in (
+                "tests failed",
+                "test failed",
+                "compilation failed",
+                "build failed",
+                "tests passed",
+                "all tests passed",
+                "compilation succeeded",
+                "compile check passed",
+            )
+        )
+    )
+
+
+def summary_has_validation_execution_context(summary: dict) -> bool:
+    if not summary_has_tool_activity(summary):
+        return False
+    tool_name = str(summary.get("tool_name") or "").lower()
+    name_category = classify_tool_name(tool_name)
+    if name_category in {"read", "list"}:
+        return False
+    if name_category in VALIDATION_EXECUTION_TOOL_CATEGORIES:
+        return True
+    if any(
+        marker in tool_name
+        for marker in (
+            "bash",
+            "shell",
+            "cmd",
+            "powershell",
+            "terminal",
+            "exec",
+            "command",
+            "test",
+            "pytest",
+            "unittest",
+            "debug_force_recompile",
+            "debug_check_compilation",
+            "console_get_logs",
+        )
+    ):
+        return True
+
+    if tool_name:
+        return False
+
+    event_type = str(summary.get("type") or "").lower()
+    part_type = str(summary.get("part_type") or "").lower()
+    text = compact_summary_text(summary).lower()
+    if not ("tool" in event_type or "tool" in part_type):
+        return False
+    if not detect_observed_validation_tools_from_text(text):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "command",
+            "executed",
+            "ran",
+            "running",
+            "exit code",
+            "return code",
+            "stdout",
+            "stderr",
+        )
+    )
+
+
+def remember_observed_validation_tools_locked(target, text: str, *, execution_context: bool = False) -> None:
+    if not hasattr(target, "observed_validation_tools"):
+        return
+    if not execution_context:
+        return
+    for tool in detect_observed_validation_tools_from_text(text):
+        if tool not in target.observed_validation_tools:
+            target.observed_validation_tools.append(tool)
+    if (target.observed_validation_tools or text_has_validation_result_marker(text)) and hasattr(
+        target,
+        "observed_validation_texts",
+    ):
+        target.observed_validation_texts.append(preview_event_text(text, EVENT_TEXT_PREVIEW_CHARS) or "")
+
+
 def record_stdout_event_diagnostics_locked(target, text: str, observed_at: str) -> None:
     if not hasattr(target, "recent_events"):
         return
@@ -1224,6 +1455,9 @@ def record_stdout_event_diagnostics_locked(target, text: str, observed_at: str) 
         summary = summarize_opencode_event(event, observed_at)
         target.recent_events.append(summary)
         target.recent_event_count += 1
+        if getattr(target, "first_event_at", None) is None:
+            target.first_event_at = observed_at
+        target.last_event_observed_at = observed_at
         target.last_event_type = summary.get("type")
         target.last_event_at = summary.get("timestamp")
         target.last_event_summary = dict(summary)
@@ -1236,8 +1470,20 @@ def record_stdout_event_diagnostics_locked(target, text: str, observed_at: str) 
             target.last_text_output = summary.get("text_preview")
 
         if summary_has_tool_activity(summary):
+            if getattr(target, "first_tool_at", None) is None:
+                target.first_tool_at = observed_at
             target.last_tool_name = summary.get("tool_name")
             target.last_tool_event = dict(summary)
+            category = classify_tool_activity(summary.get("tool_name"), summary)
+            counts = getattr(target, "tool_activity_counts", None)
+            if isinstance(counts, dict):
+                counts[category] = int(counts.get(category, 0)) + 1
+            if summary_has_validation_execution_context(summary):
+                remember_observed_validation_tools_locked(
+                    target,
+                    compact_summary_text(summary),
+                    execution_context=True,
+                )
 
         event_type = str(summary.get("type") or "").lower()
         part_type = str(summary.get("part_type") or "").lower()
@@ -1843,6 +2089,7 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
         if new_changed_files and current_change_fingerprints != previous_change_fingerprints:
             if job.first_change_at is None:
                 job.first_change_at = now
+            job.last_change_at = now
             if snapshot_gap_seconds is not None and snapshot_gap_seconds <= STALL_CHANGED_FILES_NO_ACTIVITY_SECONDS:
                 job.last_activity_at = now
                 job.last_trusted_change_activity_at = now
@@ -2179,6 +2426,565 @@ def build_validation_note(status: str) -> str:
     return base
 
 
+def compact_progress_message(text: str) -> str:
+    return preview_event_text(text, PROGRESS_MESSAGE_MAX_CHARS) or ""
+
+
+def tool_activity_summary_locked(job: OpenCodeJob) -> dict:
+    counts = dict(job.tool_activity_counts or {})
+    return {category: int(counts.get(category, 0)) for category in TOOL_ACTIVITY_CATEGORIES}
+
+
+def ordered_validation_tools(tools: list[str]) -> list[str]:
+    unique = ordered_unique([tool for tool in tools if tool])
+    order = {tool: index for index, tool in enumerate(OBSERVED_VALIDATION_TOOL_ORDER)}
+    return sorted(unique, key=lambda item: (order.get(item, len(order)), item))
+
+
+def extract_validation_error_counts(text: str) -> list[int]:
+    patterns = (
+        r"\b(\d+)\s+errors?\b",
+        r"\berrors?\s*[:=]\s*(\d+)\b",
+        r"\berror\s+count\s*[:=]\s*(\d+)\b",
+    )
+    counts: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            try:
+                counts.append(int(match.group(1)))
+            except (TypeError, ValueError):
+                continue
+    return counts
+
+
+def extract_validation_errors_count(text: str) -> int | None:
+    counts = extract_validation_error_counts(text)
+    if not counts:
+        return None
+    nonzero_counts = [count for count in counts if count > 0]
+    if nonzero_counts:
+        return nonzero_counts[-1]
+    return 0
+
+
+def build_observed_validation_diagnostics_locked(job: OpenCodeJob) -> dict:
+    execution_text = " ".join(str(item) for item in job.observed_validation_texts if item)
+    scan_text = " ".join(
+        part
+        for part in (
+            execution_text,
+            " ".join(job.observed_validation_tools),
+        )
+        if part
+    )
+    tools = ordered_validation_tools(
+        list(job.observed_validation_tools) + detect_observed_validation_tools_from_text(execution_text)
+    )
+
+    if not tools:
+        return {
+            "observed_validation_summary": "No validation activity observed.",
+            "observed_validation_tools": [],
+            "observed_validation_result": "none",
+            "observed_validation_errors_count": None,
+        }
+
+    error_counts = extract_validation_error_counts(scan_text)
+    errors_count = extract_validation_errors_count(scan_text)
+    lowered = scan_text.lower()
+    has_failure_marker = any(
+        marker in lowered
+        for marker in ("tests failed", "test failed", "compilation failed", "build failed")
+    )
+    has_pass_marker = any(
+        marker in lowered
+        for marker in ("tests passed", "all tests passed", "compilation succeeded", "compile check passed")
+    )
+    if has_failure_marker or any(count > 0 for count in error_counts):
+        result = "failed"
+    elif errors_count == 0:
+        result = "passed"
+    elif has_pass_marker:
+        result = "passed"
+    elif re.search(r"\b(ok|passed|success|succeeded)\b", lowered) and not re.search(r"\b(fail|failed|error)\b", lowered):
+        result = "passed"
+    else:
+        result = "inconclusive"
+
+    if result == "failed":
+        summary = "Validation activity observed with a failing-looking result."
+    elif errors_count is not None and any(tool.startswith("unity_skills_") for tool in tools):
+        summary = f"Unity Skills validation activity observed: {errors_count} error(s)."
+    elif result == "passed":
+        summary = "Validation activity observed with a passing-looking result."
+    else:
+        summary = "Validation activity observed, but the result is inconclusive."
+
+    return {
+        "observed_validation_summary": compact_progress_message(summary),
+        "observed_validation_tools": tools,
+        "observed_validation_result": result,
+        "observed_validation_errors_count": errors_count,
+    }
+
+
+def build_time_diagnostics_locked(job: OpenCodeJob, end_timestamp: float | None) -> dict:
+    started_timestamp = parse_timestamp_seconds(job.started_at)
+    first_output_timestamp = parse_timestamp_seconds(job.first_output_at)
+    first_event_timestamp = parse_timestamp_seconds(job.first_event_at)
+    first_tool_timestamp = parse_timestamp_seconds(job.first_tool_at)
+    first_change_timestamp = parse_timestamp_seconds(job.first_change_at)
+    last_event_timestamp = parse_timestamp_seconds(job.last_event_observed_at)
+    last_change_timestamp = parse_timestamp_seconds(job.last_change_at)
+    return {
+        "time_to_first_output_seconds": elapsed_seconds(started_timestamp, first_output_timestamp),
+        "time_to_first_event_seconds": elapsed_seconds(started_timestamp, first_event_timestamp),
+        "time_to_first_tool_seconds": elapsed_seconds(started_timestamp, first_tool_timestamp),
+        "time_to_first_change_seconds": elapsed_seconds(started_timestamp, first_change_timestamp),
+        "seconds_since_last_event": elapsed_seconds(last_event_timestamp, end_timestamp),
+        "seconds_since_last_change": elapsed_seconds(last_change_timestamp, end_timestamp),
+    }
+
+
+def short_gap_label(label: str) -> str:
+    return preview_event_text(label.replace("_", " "), LONG_GAP_LABEL_MAX_CHARS) or label
+
+
+def guess_gap_phase(after_label: str, before_label: str, progress_phase: str, validation_observed: bool) -> str:
+    if before_label in {"first_output", "current_status", "finished"} and after_label == "job_started":
+        return "waiting_first_output"
+    if before_label == "first_event":
+        return "slow_before_first_event"
+    if before_label in {"first_change", "last_change"}:
+        return "slow_before_first_change"
+    if after_label in {"first_change", "last_change"}:
+        return "slow_validation" if validation_observed else "slow_after_edit"
+    if validation_observed:
+        return "slow_validation"
+    if progress_phase in {"reading_context", "long_context_or_planning"}:
+        return "slow_context_reading"
+    if progress_phase in {"planning_or_reasoning", "waiting_first_output"}:
+        return progress_phase
+    return "unknown"
+
+
+def build_long_gap_segments_locked(
+    job: OpenCodeJob,
+    *,
+    end_timestamp: float | None,
+    progress_phase: str,
+    validation_observed: bool,
+) -> list[dict]:
+    points: list[tuple[float, str, int]] = []
+
+    def add_point(timestamp_text: str | None, label: str, order: int) -> None:
+        timestamp = parse_timestamp_seconds(timestamp_text)
+        if timestamp is not None:
+            points.append((timestamp, label, order))
+
+    add_point(job.started_at, "job_started", 0)
+    add_point(job.first_output_at, "first_output", 1)
+    add_point(job.first_event_at, "first_event", 2)
+    add_point(job.first_tool_at, "first_tool", 3)
+    add_point(job.first_change_at, "first_change", 4)
+    add_point(job.last_change_at, "last_change", 5)
+    add_point(job.last_event_observed_at, "last_event", 6)
+    if end_timestamp is not None:
+        end_label = "finished" if job.finished_at else "current_status"
+        points.append((end_timestamp, end_label, 7))
+
+    points.sort(key=lambda item: (item[0], item[2]))
+    if len(points) < 2:
+        return []
+
+    gaps: list[dict] = []
+    for index in range(1, len(points)):
+        previous_timestamp, previous_label, _previous_order = points[index - 1]
+        current_timestamp, current_label, _current_order = points[index]
+        duration = elapsed_seconds(previous_timestamp, current_timestamp)
+        if duration is None or duration < LONG_GAP_MIN_SECONDS:
+            continue
+        gaps.append(
+            {
+                "duration_seconds": duration,
+                "after": short_gap_label(previous_label),
+                "before": short_gap_label(current_label),
+                "phase_guess": guess_gap_phase(previous_label, current_label, progress_phase, validation_observed),
+            }
+        )
+
+    gaps.sort(key=lambda item: item["duration_seconds"], reverse=True)
+    return gaps[:MAX_LONG_GAP_SEGMENTS]
+
+
+def session_reuse_mode_from_flags(
+    requested_session_id: str | None,
+    continue_last: bool,
+    fork_session: bool,
+) -> str:
+    if fork_session:
+        return "fork_session"
+    if continue_last:
+        return "continue_last"
+    if requested_session_id:
+        return "explicit_session"
+    return "none"
+
+
+def session_keys_for_snapshot(snapshot: dict) -> set[str]:
+    return {
+        str(value)
+        for value in (
+            snapshot.get("requested_session_id"),
+            snapshot.get("session_id"),
+            snapshot.get("last_session_id"),
+        )
+        if value
+    }
+
+
+def job_session_snapshot(job: OpenCodeJob) -> dict:
+    with job.lock:
+        return {
+            "job_id": job.job_id,
+            "working_dir": job.working_dir,
+            "requested_session_id": job.requested_session_id,
+            "session_id": job.session_id,
+            "last_session_id": job.last_session_id,
+            "continue_last": job.continue_last,
+            "fork_session": job.fork_session,
+            "status": job.status,
+            "started_at": job.started_at,
+            "new_changed_files": list(job.new_changed_files),
+            "preexisting_changed_files": list(job.preexisting_changed_files),
+        }
+
+
+def collect_session_history_context(job: OpenCodeJob) -> dict:
+    target = job_session_snapshot(job)
+    session_keys = session_keys_for_snapshot(target)
+    preferred_key = (
+        target.get("requested_session_id")
+        or target.get("session_id")
+        or target.get("last_session_id")
+    )
+    reuse_detected = bool(
+        target.get("requested_session_id")
+        or target.get("continue_last")
+        or target.get("fork_session")
+    )
+    context = {
+        "reuse_detected": reuse_detected,
+        "mode": session_reuse_mode_from_flags(
+            target.get("requested_session_id"),
+            bool(target.get("continue_last")),
+            bool(target.get("fork_session")),
+        ),
+        "same_session_recent_job_count": 0,
+        "same_session_last_job_status": None,
+        "previous_abnormal_status": False,
+        "working_dir_mismatch": False,
+        "likely_preexisting_same_session_files": [],
+        "history_available": False,
+    }
+    if not preferred_key and not session_keys:
+        return context
+
+    with _REGISTRY_LOCK:
+        job_list = list(_JOBS.values())
+
+    matches: list[dict] = []
+    for candidate in job_list:
+        snapshot = job_session_snapshot(candidate)
+        candidate_keys = session_keys_for_snapshot(snapshot)
+        if preferred_key:
+            matched = preferred_key in candidate_keys
+        else:
+            matched = bool(session_keys & candidate_keys)
+        if matched:
+            matches.append(snapshot)
+
+    matches.sort(key=lambda item: parse_timestamp_seconds(item.get("started_at")) or 0.0)
+    current_started = parse_timestamp_seconds(target.get("started_at")) or 0.0
+    previous_matches = [
+        item
+        for item in matches
+        if item.get("job_id") != target.get("job_id")
+        and (parse_timestamp_seconds(item.get("started_at")) or 0.0) <= current_started
+    ]
+    context["same_session_recent_job_count"] = len(matches)
+    context["history_available"] = bool(previous_matches)
+    if previous_matches:
+        last_job = previous_matches[-1]
+        context["same_session_last_job_status"] = last_job.get("status")
+    context["previous_abnormal_status"] = any(
+        item.get("status") in {"failed", "cancelled", "timed_out"}
+        for item in previous_matches
+    )
+    context["working_dir_mismatch"] = any(
+        item.get("working_dir") and item.get("working_dir") != target.get("working_dir")
+        for item in previous_matches
+    )
+
+    preexisting_by_key = {
+        git_path_key(path): path
+        for path in target.get("preexisting_changed_files", [])
+    }
+    related_files: list[str] = []
+    for previous in previous_matches:
+        for changed_file in previous.get("new_changed_files", []):
+            key = git_path_key(changed_file)
+            if key in preexisting_by_key:
+                related_files.append(preexisting_by_key[key])
+    context["likely_preexisting_same_session_files"] = sort_paths(ordered_unique(related_files))[:20]
+    return context
+
+
+def build_session_reuse_diagnostics(
+    context: dict,
+    *,
+    no_event_noop_risk: bool,
+) -> dict:
+    reuse_detected = bool(context.get("reuse_detected"))
+    likely_files = list(context.get("likely_preexisting_same_session_files") or [])
+    session_reuse_risk = False
+    if not reuse_detected:
+        note = "no_session_reuse"
+    elif no_event_noop_risk:
+        note = "no_event_noop_risk"
+        session_reuse_risk = True
+    elif context.get("working_dir_mismatch"):
+        note = "working_dir_mismatch"
+        session_reuse_risk = True
+    elif context.get("previous_abnormal_status"):
+        note = "previous_session_job_failed"
+        session_reuse_risk = True
+    elif context.get("history_available"):
+        note = "same_working_dir_recent_session"
+    else:
+        note = "session_history_unavailable"
+
+    return {
+        "session_reuse_detected": reuse_detected,
+        "session_reuse_mode": context.get("mode") or "none",
+        "session_reuse_risk": session_reuse_risk,
+        "session_reuse_note": note,
+        "same_session_recent_job_count": int(context.get("same_session_recent_job_count") or 0),
+        "same_session_last_job_status": context.get("same_session_last_job_status"),
+        "likely_preexisting_from_same_session": bool(likely_files),
+        "likely_preexisting_same_session_files": likely_files,
+    }
+
+
+def is_validation_progress(validation_diagnostics: dict) -> bool:
+    return bool(validation_diagnostics.get("observed_validation_tools"))
+
+
+def build_root_cause_guess(
+    *,
+    status: str,
+    progress_phase: str,
+    runtime_seconds: float | None,
+    idle_seconds: float | None,
+    time_diagnostics: dict,
+    tool_activity_summary: dict,
+    no_event_noop_risk: bool,
+    is_stalled: bool,
+    validation_observed: bool,
+) -> str:
+    if no_event_noop_risk:
+        return "no_event_noop"
+    if is_stalled:
+        return "stalled_running"
+    if status not in ACTIVE_STATUSES and status != "completed":
+        return "unknown"
+
+    runtime = runtime_seconds or 0.0
+    time_to_first_output = time_diagnostics["time_to_first_output_seconds"]
+    time_to_first_event = time_diagnostics["time_to_first_event_seconds"]
+    time_to_first_change = time_diagnostics["time_to_first_change_seconds"]
+    seconds_since_last_change = time_diagnostics["seconds_since_last_change"]
+
+    if time_to_first_output is not None and time_to_first_output >= SLOW_FIRST_OUTPUT_SECONDS:
+        return "slow_startup_or_attach"
+    if time_to_first_output is None and status in ACTIVE_STATUSES and runtime >= PROGRESS_STARTUP_SECONDS:
+        return "slow_startup_or_attach"
+    if time_to_first_event is not None and time_to_first_event >= SLOW_FIRST_EVENT_SECONDS:
+        return "slow_before_first_event"
+    if time_to_first_event is None and time_to_first_output is not None and status in ACTIVE_STATUSES:
+        return "slow_before_first_event"
+    if time_to_first_change is None and runtime >= NO_FIRST_CHANGE_BUDGET_SECONDS:
+        if tool_activity_summary.get("read", 0) or tool_activity_summary.get("list", 0):
+            return "slow_context_reading"
+        return "slow_before_first_change"
+    if time_to_first_change is not None and time_to_first_change >= NO_FIRST_CHANGE_BUDGET_SECONDS:
+        if tool_activity_summary.get("read", 0) or tool_activity_summary.get("list", 0):
+            return "slow_context_reading"
+        return "slow_before_first_change"
+    if (
+        time_to_first_change is not None
+        and seconds_since_last_change is not None
+        and seconds_since_last_change >= SLOW_AFTER_CHANGE_SECONDS
+    ):
+        return "slow_validation" if validation_observed else "slow_after_edit"
+    if time_to_first_change is not None and validation_observed and status in ACTIVE_STATUSES:
+        return "slow_validation"
+    if time_to_first_change is not None and idle_seconds is not None and idle_seconds >= STALL_NO_ACTIVITY_SECONDS / 2:
+        return "slow_after_edit"
+    if progress_phase == "validating":
+        return "slow_validation"
+    if status == "completed":
+        return "completed_normally"
+    return "unknown"
+
+
+def build_progress_diagnostics_locked(
+    job: OpenCodeJob,
+    *,
+    status: str,
+    process_running: bool,
+    runtime_seconds: float | None,
+    idle_seconds: float | None,
+    stall_diagnostics: dict,
+    event_diagnostics: dict,
+    no_event_noop_diagnostics: dict,
+    validation_diagnostics: dict,
+    time_diagnostics: dict,
+    tool_activity_summary: dict,
+) -> dict:
+    validation_observed = is_validation_progress(validation_diagnostics)
+    first_change_recent = (
+        time_diagnostics["seconds_since_last_change"] is not None
+        and time_diagnostics["seconds_since_last_change"] <= RECENT_FIRST_CHANGE_UPDATE_SECONDS
+    )
+
+    if no_event_noop_diagnostics["no_event_noop_risk"]:
+        phase = "no_event_noop_risk"
+    elif status == "completed":
+        phase = "completed"
+    elif status == "failed":
+        phase = "failed"
+    elif status == "cancelled":
+        phase = "cancelled"
+    elif status == "timed_out":
+        phase = "stalled" if stall_diagnostics["is_stalled"] else "timed_out"
+    elif stall_diagnostics["is_stalled"]:
+        phase = "stalled"
+    elif status == "starting":
+        phase = "starting"
+    elif validation_observed:
+        phase = "validating"
+    elif job.first_change_at:
+        if process_running and event_diagnostics.get("last_step_status") in {"finished", "completed", "done"}:
+            phase = "finalizing"
+        else:
+            phase = "editing"
+    elif not job.first_output_at:
+        phase = "starting" if (runtime_seconds or 0.0) < PROGRESS_STARTUP_SECONDS else "waiting_first_output"
+    elif runtime_seconds is not None and runtime_seconds >= NO_FIRST_CHANGE_BUDGET_SECONDS:
+        phase = "long_context_or_planning"
+    elif tool_activity_summary.get("read", 0) or tool_activity_summary.get("list", 0):
+        phase = "reading_context"
+    elif job.recent_event_count > 0 or event_diagnostics.get("last_text_output"):
+        phase = "planning_or_reasoning"
+    else:
+        phase = "waiting_first_output"
+
+    if phase == "no_event_noop_risk":
+        message = "Completed with no events, no output, and no job-scoped changes under session reuse; review or retry with a fresh session."
+    elif phase == "completed":
+        message = "OpenCode completed; review changed files and observed validation before accepting the job."
+    elif phase == "failed":
+        message = "OpenCode failed; inspect status, stderr/tail only if needed, and any changed files."
+    elif phase == "cancelled":
+        message = "OpenCode was cancelled; review any job-scoped file changes left in the worktree."
+    elif phase == "timed_out":
+        message = "The MCP wait window elapsed while OpenCode kept running; poll status or consider cancellation."
+    elif phase == "stalled":
+        message = f"No trusted activity recently ({stall_diagnostics['stall_reason']}); consider review or cancellation."
+    elif phase == "starting":
+        message = "OpenCode process is starting; no first output has been observed yet."
+    elif phase == "waiting_first_output":
+        message = "Waiting for the first OpenCode stdout/stderr output."
+    elif phase == "reading_context":
+        message = "OpenCode has tool activity that looks like context reading/listing; no job-scoped change observed yet."
+    elif phase == "planning_or_reasoning":
+        message = "OpenCode has produced events/text, but no job-scoped file change has been observed yet."
+    elif phase == "long_context_or_planning":
+        message = "No job-scoped file change after the planning budget; likely reading context or planning."
+    elif phase == "editing":
+        message = "Job-scoped file changes have been observed; OpenCode appears to be editing."
+    elif phase == "validating":
+        tools = ", ".join(validation_diagnostics.get("observed_validation_tools") or [])
+        message = f"Validation-like activity observed{': ' + tools if tools else ''}."
+    elif phase == "finalizing":
+        message = "A finishing step was observed after edits; OpenCode may be wrapping up."
+    else:
+        message = "OpenCode progress is observable, but the wrapper cannot classify the current phase."
+
+    if no_event_noop_diagnostics["no_event_noop_risk"]:
+        caller_update_recommended = True
+        caller_update_reason = "no_event_noop_risk"
+    elif job.policy_violation:
+        caller_update_recommended = True
+        caller_update_reason = "policy_violation"
+    elif stall_diagnostics["is_stalled"]:
+        caller_update_recommended = True
+        caller_update_reason = "stalled"
+    elif status in {"completed", "failed", "cancelled", "timed_out"}:
+        caller_update_recommended = True
+        caller_update_reason = "terminal_status"
+    elif validation_observed and validation_diagnostics.get("observed_validation_result") in {"passed", "failed"}:
+        caller_update_recommended = True
+        caller_update_reason = "validation_observed"
+    elif first_change_recent:
+        caller_update_recommended = True
+        caller_update_reason = "first_change_seen"
+    elif phase == "long_context_or_planning":
+        caller_update_recommended = True
+        caller_update_reason = "no_first_change_after_budget"
+    else:
+        caller_update_recommended = False
+        caller_update_reason = "continue_silent_poll"
+
+    next_poll_by_phase = {
+        "not_found": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "no_event_noop_risk": 0,
+        "timed_out": 10,
+        "stalled": 15,
+        "starting": 2,
+        "waiting_first_output": 5,
+        "reading_context": 10,
+        "planning_or_reasoning": 10,
+        "long_context_or_planning": 15,
+        "editing": 5,
+        "validating": 10,
+        "finalizing": 5,
+    }
+    root_cause_guess = build_root_cause_guess(
+        status=status,
+        progress_phase=phase,
+        runtime_seconds=runtime_seconds,
+        idle_seconds=idle_seconds,
+        time_diagnostics=time_diagnostics,
+        tool_activity_summary=tool_activity_summary,
+        no_event_noop_risk=no_event_noop_diagnostics["no_event_noop_risk"],
+        is_stalled=stall_diagnostics["is_stalled"],
+        validation_observed=validation_observed,
+    )
+    return {
+        "progress_phase": phase,
+        "progress_message": compact_progress_message(message),
+        "caller_update_recommended": caller_update_recommended,
+        "caller_update_reason": caller_update_reason,
+        "next_poll_after_seconds": next_poll_by_phase.get(phase, 10),
+        "root_cause_guess": root_cause_guess,
+    }
+
+
 def event_summary_phase(summary: dict | None) -> str:
     if not summary:
         return "no_event_seen"
@@ -2315,6 +3121,7 @@ def job_to_result(
     if is_job_active(job):
         refresh_job_snapshot(job)
 
+    session_history_context = collect_session_history_context(job)
     effective_tail_max_chars = clamp_tail_max_chars(tail_max_chars)
     with job.lock:
         full_stdout_tail = tail_to_text(job.stdout_tail, effective_tail_max_chars)
@@ -2359,6 +3166,9 @@ def job_to_result(
             runtime_seconds=runtime_seconds,
             idle_seconds=idle_seconds,
         )
+        time_diagnostics = build_time_diagnostics_locked(job, end_timestamp)
+        tool_activity_summary = tool_activity_summary_locked(job)
+        validation_observation = build_observed_validation_diagnostics_locked(job)
         event_diagnostics = build_event_diagnostics_locked(
             job,
             status=status,
@@ -2374,6 +3184,29 @@ def job_to_result(
             stderr_tail=full_stderr_tail,
             stdout_delta=stdout_delta_raw,
             stderr_delta=stderr_delta_raw,
+        )
+        session_reuse_diagnostics = build_session_reuse_diagnostics(
+            session_history_context,
+            no_event_noop_risk=no_event_noop_diagnostics["no_event_noop_risk"],
+        )
+        progress_diagnostics = build_progress_diagnostics_locked(
+            job,
+            status=status,
+            process_running=process_running,
+            runtime_seconds=runtime_seconds,
+            idle_seconds=idle_seconds,
+            stall_diagnostics=stall_diagnostics,
+            event_diagnostics=event_diagnostics,
+            no_event_noop_diagnostics=no_event_noop_diagnostics,
+            validation_diagnostics=validation_observation,
+            time_diagnostics=time_diagnostics,
+            tool_activity_summary=tool_activity_summary,
+        )
+        long_gap_segments = build_long_gap_segments_locked(
+            job,
+            end_timestamp=end_timestamp,
+            progress_phase=progress_diagnostics["progress_phase"],
+            validation_observed=is_validation_progress(validation_observation),
         )
         suggested_action = stall_diagnostics["suggested_action"]
         review_required = change_risk_fields["review_required"]
@@ -2439,6 +3272,32 @@ def job_to_result(
             "last_activity_at": job.last_activity_at,
             "runtime_seconds": runtime_seconds,
             "idle_seconds": idle_seconds,
+            "progress_phase": progress_diagnostics["progress_phase"],
+            "progress_message": progress_diagnostics["progress_message"],
+            "caller_update_recommended": progress_diagnostics["caller_update_recommended"],
+            "caller_update_reason": progress_diagnostics["caller_update_reason"],
+            "next_poll_after_seconds": progress_diagnostics["next_poll_after_seconds"],
+            "time_to_first_output_seconds": time_diagnostics["time_to_first_output_seconds"],
+            "time_to_first_event_seconds": time_diagnostics["time_to_first_event_seconds"],
+            "time_to_first_tool_seconds": time_diagnostics["time_to_first_tool_seconds"],
+            "time_to_first_change_seconds": time_diagnostics["time_to_first_change_seconds"],
+            "seconds_since_last_event": time_diagnostics["seconds_since_last_event"],
+            "seconds_since_last_change": time_diagnostics["seconds_since_last_change"],
+            "tool_activity_summary": tool_activity_summary,
+            "long_gap_segments": long_gap_segments,
+            "root_cause_guess": progress_diagnostics["root_cause_guess"],
+            "session_reuse_detected": session_reuse_diagnostics["session_reuse_detected"],
+            "session_reuse_mode": session_reuse_diagnostics["session_reuse_mode"],
+            "session_reuse_risk": session_reuse_diagnostics["session_reuse_risk"],
+            "session_reuse_note": session_reuse_diagnostics["session_reuse_note"],
+            "same_session_recent_job_count": session_reuse_diagnostics["same_session_recent_job_count"],
+            "same_session_last_job_status": session_reuse_diagnostics["same_session_last_job_status"],
+            "likely_preexisting_from_same_session": session_reuse_diagnostics["likely_preexisting_from_same_session"],
+            "likely_preexisting_same_session_files": session_reuse_diagnostics["likely_preexisting_same_session_files"],
+            "observed_validation_summary": validation_observation["observed_validation_summary"],
+            "observed_validation_tools": validation_observation["observed_validation_tools"],
+            "observed_validation_result": validation_observation["observed_validation_result"],
+            "observed_validation_errors_count": validation_observation["observed_validation_errors_count"],
             "last_event_type": event_diagnostics["last_event_type"],
             "last_event_at": event_diagnostics["last_event_at"],
             "last_event_summary": event_diagnostics["last_event_summary"],
@@ -2534,6 +3393,32 @@ def make_job_not_found_result(job_id: str) -> dict:
         "last_activity_at": None,
         "runtime_seconds": None,
         "idle_seconds": None,
+        "progress_phase": "not_found",
+        "progress_message": "Job id was not found; no progress data is available.",
+        "caller_update_recommended": True,
+        "caller_update_reason": "not_found",
+        "next_poll_after_seconds": 0,
+        "time_to_first_output_seconds": None,
+        "time_to_first_event_seconds": None,
+        "time_to_first_tool_seconds": None,
+        "time_to_first_change_seconds": None,
+        "seconds_since_last_event": None,
+        "seconds_since_last_change": None,
+        "tool_activity_summary": {category: 0 for category in TOOL_ACTIVITY_CATEGORIES},
+        "long_gap_segments": [],
+        "root_cause_guess": "unknown",
+        "session_reuse_detected": False,
+        "session_reuse_mode": "none",
+        "session_reuse_risk": False,
+        "session_reuse_note": "no_session_reuse",
+        "same_session_recent_job_count": 0,
+        "same_session_last_job_status": None,
+        "likely_preexisting_from_same_session": False,
+        "likely_preexisting_same_session_files": [],
+        "observed_validation_summary": "No validation activity observed.",
+        "observed_validation_tools": [],
+        "observed_validation_result": "none",
+        "observed_validation_errors_count": None,
         "last_event_type": event_diagnostics["last_event_type"],
         "last_event_at": event_diagnostics["last_event_at"],
         "last_event_summary": event_diagnostics["last_event_summary"],

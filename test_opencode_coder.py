@@ -104,6 +104,239 @@ def fake_command(
             "for event in events:\n"
             "    print(json.dumps(event), flush=True)\n"
         )
+    elif prompt == "read_event_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_read",
+            "messageID": "msg_read",
+            "part": {"type": "tool", "name": "read", "status": "started"},
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt == "bash_tool_event_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_bash",
+            "messageID": "msg_bash",
+            "part": {
+                "type": "tool",
+                "name": "bash",
+                "status": "started",
+                "text": "python -m py_compile opencode-coder.py",
+            },
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt == "validation_words_text_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_text_validation_words",
+            "messageID": "msg_text_validation_words",
+            "part": {
+                "type": "text",
+                "text": (
+                    "README says to run python -m py_compile, "
+                    "debug_check_compilation, and git diff --check later."
+                ),
+            },
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt == "validation_words_stdout_then_sleep":
+        code = (
+            "import time\n"
+            "print('Docs mention python -m py_compile, debug_check_compilation, and git diff --check', flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt == "read_tool_validation_words_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_read_validation_words",
+            "messageID": "msg_read_validation_words",
+            "part": {
+                "type": "tool",
+                "name": "read",
+                "status": "completed",
+                "text": (
+                    "README content mentions python -m py_compile, "
+                    "debug_check_compilation, git diff --check, and 0 errors."
+                ),
+            },
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt == "glob_tool_validation_words_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_glob_validation_words",
+            "messageID": "msg_glob_validation_words",
+            "part": {
+                "type": "tool",
+                "name": "glob",
+                "status": "completed",
+                "text": (
+                    "Matched docs that mention python -m py_compile, "
+                    "debug_check_compilation, git diff --check, and 0 errors."
+                ),
+            },
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
+    elif prompt == "unity_validation_events":
+        events = [
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity",
+                "messageID": "msg_unity_1",
+                "part": {"type": "tool", "name": "unity_skills_debug_force_recompile", "status": "completed"},
+            },
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity",
+                "messageID": "msg_unity_2",
+                "part": {"type": "tool", "name": "unity_skills_debug_check_compilation", "status": "completed"},
+            },
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity",
+                "messageID": "msg_unity_3",
+                "part": {
+                    "type": "tool",
+                    "name": "unity_skills_console_get_logs",
+                    "status": "completed",
+                    "text": "Unity Skills compile check observed: 0 errors",
+                },
+            },
+        ]
+        code = (
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+        )
+    elif prompt == "unity_validation_failed_after_pass":
+        events = [
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity_failed",
+                "messageID": "msg_unity_failed_1",
+                "part": {
+                    "type": "tool",
+                    "name": "unity_skills_console_get_logs",
+                    "status": "completed",
+                    "text": "Unity Skills compile check observed: 0 errors",
+                },
+            },
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity_failed",
+                "messageID": "msg_unity_failed_2",
+                "part": {
+                    "type": "tool",
+                    "name": "unity_skills_console_get_logs",
+                    "status": "completed",
+                    "text": "Unity Skills compile check observed: 2 errors; compilation failed",
+                },
+            },
+        ]
+        code = (
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+        )
+    elif prompt == "unity_validation_failed_then_zero":
+        events = [
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity_failed_then_zero",
+                "messageID": "msg_unity_failed_then_zero_1",
+                "part": {
+                    "type": "tool",
+                    "name": "unity_skills_console_get_logs",
+                    "status": "completed",
+                    "text": "Unity Skills compile check observed: compilation failed",
+                },
+            },
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_unity_failed_then_zero",
+                "messageID": "msg_unity_failed_then_zero_2",
+                "part": {
+                    "type": "tool",
+                    "name": "unity_skills_console_get_logs",
+                    "status": "completed",
+                    "text": "Unity Skills compile check observed: 0 errors",
+                },
+            },
+        ]
+        code = (
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+        )
+    elif prompt == "gap_events":
+        events = [
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_gap",
+                "messageID": "msg_gap_1",
+                "part": {"type": "text", "text": "Reading context"},
+            },
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_gap",
+                "messageID": "msg_gap_2",
+                "part": {"type": "tool", "name": "read", "status": "completed"},
+            },
+            {
+                "type": "message.part.updated",
+                "sessionID": "ses_gap",
+                "messageID": "msg_gap_3",
+                "part": {"type": "tool", "name": "bash", "status": "completed"},
+            },
+            {
+                "type": "step",
+                "sessionID": "ses_gap",
+                "messageID": "msg_gap_4",
+                "status": "finished",
+                "reason": "stop",
+            },
+        ]
+        code = (
+            "import json\n"
+            "import time\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+            "    time.sleep(0.04)\n"
+        )
     elif prompt == "many_opencode_events":
         code = (
             "import json\n"
@@ -266,6 +499,26 @@ def fake_command(
             "path.parent.mkdir(parents=True, exist_ok=True)\n"
             "path.write_text('generated\\n', encoding='utf-8')\n"
             "time.sleep(0.5)\n"
+            "print(f'done {path}', flush=True)\n"
+        )
+    elif prompt.startswith("slow_read_then_write:"):
+        path = prompt.split(":", 1)[1]
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_slow_read_write",
+            "messageID": "msg_slow_read_write",
+            "part": {"type": "tool", "name": "read", "status": "completed"},
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(0.12)\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('generated after slow read\\n', encoding='utf-8')\n"
             "print(f'done {path}', flush=True)\n"
         )
     elif prompt.startswith("double_write_same_file:"):
@@ -1246,6 +1499,12 @@ class OpenCodeCoderTests(unittest.TestCase):
         )
         self.assertEqual(result["suggested_action"], "check_session_or_retry_without_session")
         self.assertTrue(result["review_required"])
+        self.assertEqual(result["progress_phase"], "no_event_noop_risk")
+        self.assertTrue(result["caller_update_recommended"])
+        self.assertEqual(result["caller_update_reason"], "no_event_noop_risk")
+        self.assertTrue(result["session_reuse_risk"])
+        self.assertEqual(result["session_reuse_note"], "no_event_noop_risk")
+        self.assertEqual(result["root_cause_guess"], "no_event_noop")
         self.assertIn(
             "completed with no stdout JSON events and no job-scoped changes",
             result["diagnostic_note"],
@@ -1253,6 +1512,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIn("session reuse may have no-oped", result["diagnostic_note"])
         self.assertTrue(status["no_event_noop_risk"])
         self.assertEqual(status["suggested_action"], "check_session_or_retry_without_session")
+        self.assertEqual(status["progress_phase"], "no_event_noop_risk")
 
     def test_attached_session_json_event_without_changes_is_not_noop_risk(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1387,6 +1647,356 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIsNone(result["last_text_output"])
         self.assertIsNone(result["work_summary_text"])
         self.assertEqual(result["diagnostic_phase"], "process_finished")
+
+    def test_progress_waiting_first_output_without_output(self):
+        original_startup = server.PROGRESS_STARTUP_SECONDS
+        server.PROGRESS_STARTUP_SECONDS = 0.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.PROGRESS_STARTUP_SECONDS = original_startup
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["progress_phase"], "waiting_first_output")
+        self.assertFalse(status["caller_update_recommended"])
+        self.assertEqual(status["caller_update_reason"], "continue_silent_poll")
+        self.assertIsNone(status["time_to_first_output_seconds"])
+        self.assertIsNone(status["time_to_first_event_seconds"])
+        self.assertIsNone(status["time_to_first_tool_seconds"])
+        self.assertIsNone(status["time_to_first_change_seconds"])
+
+    def test_progress_long_context_or_planning_after_read_without_change(self):
+        original_budget = server.NO_FIRST_CHANGE_BUDGET_SECONDS
+        original_no_activity = server.STALL_NO_ACTIVITY_SECONDS
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.NO_FIRST_CHANGE_BUDGET_SECONDS = 0.05
+        server.STALL_NO_ACTIVITY_SECONDS = 100.0
+        server.STALL_NO_OUTPUT_SECONDS = 100.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "read_event_then_sleep",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="first_output",
+                )
+                time.sleep(0.08)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.NO_FIRST_CHANGE_BUDGET_SECONDS = original_budget
+            server.STALL_NO_ACTIVITY_SECONDS = original_no_activity
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["progress_phase"], "long_context_or_planning")
+        self.assertEqual(status["caller_update_reason"], "no_first_change_after_budget")
+        self.assertEqual(status["root_cause_guess"], "slow_context_reading")
+        self.assertGreaterEqual(status["tool_activity_summary"]["read"], 1)
+        self.assertIsNotNone(status["time_to_first_event_seconds"])
+        self.assertIsNotNone(status["time_to_first_tool_seconds"])
+        self.assertIsNone(status["time_to_first_change_seconds"])
+
+    def test_first_change_progress_and_time_fields(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "delayed_write:src/changed.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+            )
+            final_status = wait_for_terminal_job(result["job_id"])
+
+        self.assertEqual(result["progress_phase"], "editing")
+        self.assertEqual(result["new_changed_files"], ["src/changed.txt"])
+        self.assertIsNotNone(result["time_to_first_change_seconds"])
+        self.assertIsNotNone(result["seconds_since_last_change"])
+        self.assertEqual(result["caller_update_reason"], "first_change_seen")
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_completed_slow_before_first_change_keeps_specific_root_cause(self):
+        original_budget = server.NO_FIRST_CHANGE_BUDGET_SECONDS
+        server.NO_FIRST_CHANGE_BUDGET_SECONDS = 0.05
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                init_git_repo(working_dir)
+                result = server.opencode_coder(
+                    "slow_read_then_write:src/slow.txt",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                )
+        finally:
+            server.NO_FIRST_CHANGE_BUDGET_SECONDS = original_budget
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["progress_phase"], "completed")
+        self.assertEqual(result["new_changed_files"], ["src/slow.txt"])
+        self.assertGreaterEqual(result["time_to_first_change_seconds"], 0.05)
+        self.assertEqual(result["root_cause_guess"], "slow_context_reading")
+        self.assertNotEqual(result["root_cause_guess"], "completed_normally")
+
+    def test_validation_words_in_plain_text_do_not_count_as_observed_validation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "validation_words_text_then_sleep",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["observed_validation_tools"], [])
+        self.assertEqual(status["observed_validation_result"], "none")
+        self.assertNotEqual(status["progress_phase"], "validating")
+        self.assertEqual(status["progress_phase"], "planning_or_reasoning")
+
+    def test_validation_words_in_plain_stdout_do_not_count_as_observed_validation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "validation_words_stdout_then_sleep",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["recent_event_count"], 0)
+        self.assertEqual(status["observed_validation_tools"], [])
+        self.assertEqual(status["observed_validation_result"], "none")
+        self.assertNotEqual(status["progress_phase"], "validating")
+
+    def test_read_tool_content_with_validation_words_is_not_observed_validation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "read_tool_validation_words_then_sleep",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertGreaterEqual(status["tool_activity_summary"]["read"], 1)
+        self.assertEqual(status["tool_activity_summary"]["unity"], 0)
+        self.assertEqual(status["observed_validation_tools"], [])
+        self.assertEqual(status["observed_validation_result"], "none")
+        self.assertNotEqual(status["progress_phase"], "validating")
+
+    def test_list_tool_content_with_validation_words_is_not_observed_validation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "glob_tool_validation_words_then_sleep",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertGreaterEqual(status["tool_activity_summary"]["list"], 1)
+        self.assertEqual(status["tool_activity_summary"]["unity"], 0)
+        self.assertEqual(status["observed_validation_tools"], [])
+        self.assertEqual(status["observed_validation_result"], "none")
+        self.assertNotEqual(status["progress_phase"], "validating")
+
+    def test_bash_tool_activity_summary_and_validation_phase(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "bash_tool_event_then_sleep",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_output",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["progress_phase"], "validating")
+        self.assertGreaterEqual(status["tool_activity_summary"]["bash"], 1)
+        self.assertIn("py_compile", status["observed_validation_tools"])
+        self.assertEqual(status["observed_validation_result"], "inconclusive")
+
+    def test_unity_validation_observation_extracts_passed_summary(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("unity_validation_events", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["progress_phase"], "completed")
+        self.assertGreaterEqual(result["tool_activity_summary"]["unity"], 3)
+        self.assertEqual(
+            result["observed_validation_tools"],
+            [
+                "unity_skills_debug_force_recompile",
+                "unity_skills_debug_check_compilation",
+                "unity_skills_console_get_logs",
+            ],
+        )
+        self.assertEqual(result["observed_validation_result"], "passed")
+        self.assertEqual(result["observed_validation_errors_count"], 0)
+        self.assertIn("0 error", result["observed_validation_summary"])
+
+    def test_observed_validation_failed_signal_wins_over_passed_signal(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "unity_validation_failed_after_pass",
+                working_dir=working_dir,
+                timeout_seconds=2,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("unity_skills_console_get_logs", result["observed_validation_tools"])
+        self.assertEqual(result["observed_validation_result"], "failed")
+        self.assertEqual(result["observed_validation_errors_count"], 2)
+        self.assertNotEqual(result["observed_validation_result"], "passed")
+        self.assertNotIn("0 error(s)", result["observed_validation_summary"])
+        self.assertIn("failing", result["observed_validation_summary"])
+
+    def test_observed_validation_failure_marker_wins_over_later_zero_errors(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "unity_validation_failed_then_zero",
+                working_dir=working_dir,
+                timeout_seconds=2,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["observed_validation_errors_count"], 0)
+        self.assertEqual(result["observed_validation_result"], "failed")
+        self.assertNotEqual(result["observed_validation_result"], "passed")
+        self.assertNotIn("0 error(s)", result["observed_validation_summary"])
+        self.assertIn("failing", result["observed_validation_summary"])
+
+    def test_terminal_statuses_recommend_caller_update(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            failed = server.opencode_coder("fail", working_dir=working_dir, timeout_seconds=2)
+            timed_out = server.opencode_coder("no_output_long", working_dir=working_dir, timeout_seconds=0)
+            try:
+                cancellable = server.opencode_coder(
+                    "very_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                    allow_concurrent=True,
+                )
+                cancelled = server.opencode_coder_cancel(cancellable["job_id"])
+            finally:
+                server.opencode_coder_cancel(timed_out["job_id"])
+
+        for result in (completed, failed, timed_out, cancelled):
+            self.assertTrue(result["caller_update_recommended"])
+            self.assertEqual(result["caller_update_reason"], "terminal_status")
+        self.assertEqual(completed["progress_phase"], "completed")
+        self.assertEqual(failed["progress_phase"], "failed")
+        self.assertEqual(timed_out["progress_phase"], "timed_out")
+        self.assertEqual(cancelled["progress_phase"], "cancelled")
+
+    def test_status_not_found_has_progress_fields(self):
+        result = server.opencode_coder_status("missing-job")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["progress_phase"], "not_found")
+        self.assertTrue(result["caller_update_recommended"])
+        self.assertEqual(result["next_poll_after_seconds"], 0)
+        self.assertEqual(result["root_cause_guess"], "unknown")
+        self.assertEqual(result["observed_validation_result"], "none")
+
+    def test_session_reuse_diagnostics_for_consecutive_jobs(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            first = server.opencode_coder(
+                "session_json",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                session_id="ses_existing",
+            )
+            second = server.opencode_coder(
+                "session_json",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                session_id="ses_existing",
+            )
+
+        self.assertTrue(first["session_reuse_detected"])
+        self.assertEqual(first["session_reuse_mode"], "explicit_session")
+        self.assertEqual(first["same_session_recent_job_count"], 1)
+        self.assertTrue(second["session_reuse_detected"])
+        self.assertEqual(second["same_session_recent_job_count"], 2)
+        self.assertEqual(second["same_session_last_job_status"], "completed")
+        self.assertFalse(second["session_reuse_risk"])
+        self.assertEqual(second["session_reuse_note"], "same_working_dir_recent_session")
+
+    def test_likely_preexisting_from_same_session_positive_and_negative(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            first = server.opencode_coder(
+                "write:src/shared.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                session_id="ses_same",
+            )
+            second = server.opencode_coder(
+                "write:src/second.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                session_id="ses_same",
+            )
+            third = server.opencode_coder(
+                "write:src/third.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                session_id="ses_other",
+            )
+
+        self.assertEqual(first["new_changed_files"], ["src/shared.txt"])
+        self.assertTrue(second["likely_preexisting_from_same_session"])
+        self.assertEqual(second["likely_preexisting_same_session_files"], ["src/shared.txt"])
+        self.assertFalse(third["likely_preexisting_from_same_session"])
+        self.assertEqual(third["likely_preexisting_same_session_files"], [])
+
+    def test_long_gap_segments_are_bounded_and_compact(self):
+        original_gap = server.LONG_GAP_MIN_SECONDS
+        server.LONG_GAP_MIN_SECONDS = 0.01
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder("gap_events", working_dir=working_dir, timeout_seconds=2)
+        finally:
+            server.LONG_GAP_MIN_SECONDS = original_gap
+
+        self.assertLessEqual(len(result["long_gap_segments"]), server.MAX_LONG_GAP_SEGMENTS)
+        self.assertGreater(len(result["long_gap_segments"]), 0)
+        for segment in result["long_gap_segments"]:
+            self.assertLessEqual(len(segment["after"]), server.LONG_GAP_LABEL_MAX_CHARS + 15)
+            self.assertLessEqual(len(segment["before"]), server.LONG_GAP_LABEL_MAX_CHARS + 15)
+            self.assertIn("duration_seconds", segment)
+            self.assertIn("phase_guess", segment)
+
+    def test_compact_diagnostics_do_not_return_large_stdout_or_raw_event_text(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("large_json_text", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(result["stdout_tail"], "")
+        self.assertEqual(result["stderr_tail"], "")
+        self.assertEqual(result["stdout_delta"], "")
+        self.assertEqual(result["stderr_delta"], "")
+        self.assertLess(len(result["progress_message"]), 300)
+        self.assertNotIn("FULL_TEXT_SENTINEL", result["progress_message"])
+        self.assertNotIn("FULL_TEXT_SENTINEL", result["observed_validation_summary"])
+        self.assertNotIn("FULL_TEXT_SENTINEL", json.dumps(result["long_gap_segments"]))
 
     def test_missing_server_id_returns_structured_failure(self):
         with tempfile.TemporaryDirectory() as working_dir:

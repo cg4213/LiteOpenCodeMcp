@@ -111,7 +111,10 @@ python -B -m unittest -v test_opencode_coder.py
 推荐把 LiteOpenCodeMcp 当作“任务调度器 + 紧凑 review 面板”，不要当作会持续吐完整终端输出的同步命令。
 
 - 默认复用 `server_id`，不要默认复用 `session_id`。只有明确需要延续 OpenCode 会话上下文时才传 `session_id`、`continue_last` 或 `fork_session`；不要跨不同 `working_dir` 或不同仓库根目录复用 session。
+- 受控复用 session 的建议边界：同一 `working_dir`、同一 feature/topic、上一 job 没有 `no_event_noop_risk`、上一 job 没有异常 terminal status，并且用户或 Feature Owner 明确允许连续上下文；不要跨 Unity 项目或仓库根复用。
+- 大工作提示词应拆小成多步 job：每轮只交付一个明确目标，完成后 review 再派发下一轮，避免长时间卡在读取/规划阶段。
 - 长任务优先使用 `wait_policy="start_only"` 或 `"first_output"`，让主对话尽快拿回控制权，再用 compact status 轮询。
+- 轮询时优先使用 `caller_update_recommended`、`caller_update_reason`、`next_poll_after_seconds` 控制汇报频率：派发后第一次状态查询建议等 60-90 秒，后续按 `next_poll_after_seconds` 或 45-90 秒节奏轮询；普通 running 且只有近期普通活动时可静默继续；terminal、首次变更、stalled、policy violation、验证观察、no-event no-op 风险等才值得汇报。
 - 普通轮询不要传 `include_tail`、`include_output`、`include_delta`。这些是调试开关，只有需要看原始 stdout/stderr 或 event 流时才打开，并配合字符上限。
 - 不要只因 `status=completed` 或 `success=true` 就接受结果。完成后必须看 `suggested_action`、`work_summary_text`、变更文件、path policy、stall/risk、`no_event_noop_risk` 和 validation 字段。
 - 如果 `no_event_noop_risk=true`，应不传 `session_id` 重试，或新开 session/server；不要把它当作正常完成。
@@ -229,6 +232,32 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
+- `progress_phase`
+- `progress_message`
+- `caller_update_recommended`
+- `caller_update_reason`
+- `next_poll_after_seconds`
+- `time_to_first_output_seconds`
+- `time_to_first_event_seconds`
+- `time_to_first_tool_seconds`
+- `time_to_first_change_seconds`
+- `seconds_since_last_event`
+- `seconds_since_last_change`
+- `tool_activity_summary`
+- `long_gap_segments`
+- `root_cause_guess`
+- `session_reuse_detected`
+- `session_reuse_mode`
+- `session_reuse_risk`
+- `session_reuse_note`
+- `same_session_recent_job_count`
+- `same_session_last_job_status`
+- `likely_preexisting_from_same_session`
+- `likely_preexisting_same_session_files`
+- `observed_validation_summary`
+- `observed_validation_tools`
+- `observed_validation_result`
+- `observed_validation_errors_count`
 - `is_stalled`
 - `stall_reason`
 - `suggested_action`
@@ -294,6 +323,32 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
+- `progress_phase`
+- `progress_message`
+- `caller_update_recommended`
+- `caller_update_reason`
+- `next_poll_after_seconds`
+- `time_to_first_output_seconds`
+- `time_to_first_event_seconds`
+- `time_to_first_tool_seconds`
+- `time_to_first_change_seconds`
+- `seconds_since_last_event`
+- `seconds_since_last_change`
+- `tool_activity_summary`
+- `long_gap_segments`
+- `root_cause_guess`
+- `session_reuse_detected`
+- `session_reuse_mode`
+- `session_reuse_risk`
+- `session_reuse_note`
+- `same_session_recent_job_count`
+- `same_session_last_job_status`
+- `likely_preexisting_from_same_session`
+- `likely_preexisting_same_session_files`
+- `observed_validation_summary`
+- `observed_validation_tools`
+- `observed_validation_result`
+- `observed_validation_errors_count`
 - `is_stalled`
 - `stall_reason`
 - `suggested_action`
@@ -348,6 +403,15 @@ debug_status = opencode_coder_status(
 - `is_stalled`：只对 active job 判断。为 `true` 表示超过 wrapper 的卡住阈值，但不等同于 failed。
 - `stall_reason`：可能是 `changed_files_no_recent_activity`、`no_output_no_change_after_start`、`no_recent_activity` 或 `timed_out_waiting_for_completion`。
 - `suggested_action`：给调用方的下一步建议，例如 `continue_polling`、`continue_polling_or_consider_cancel`、`consider_cancel`、`review_diff_then_consider_cancel`、`review_diff_or_git_status`、`check_session_or_retry_without_session`。
+- `progress_phase`：紧凑的外部可观察阶段，例如 `starting`、`waiting_first_output`、`reading_context`、`planning_or_reasoning`、`long_context_or_planning`、`editing`、`validating`、`finalizing`、`stalled`、`no_event_noop_risk`、`completed`、`failed`、`cancelled`、`timed_out` 或 `not_found`。
+- `progress_message`：面向人的短说明，不包含长 stdout、文件内容或完整 event JSON。
+- `caller_update_recommended`、`caller_update_reason`、`next_poll_after_seconds`：给调用方的轮询/汇报建议。普通 running 且只有近期普通活动时通常应静默继续；terminal 状态、policy violation、首次观察到文件变更、stalled、验证观察、长时间无 first change、no-event no-op 风险才更适合汇报。
+- `time_to_first_output_seconds`、`time_to_first_event_seconds`、`time_to_first_tool_seconds`、`time_to_first_change_seconds`、`seconds_since_last_event`、`seconds_since_last_change`：外部可观测耗时诊断。没有对应观察时返回 `null`，不会用 `0` 混淆。
+- `tool_activity_summary`：基于有界 tool event 摘要统计的 read/edit/bash/list/unity/other 计数。
+- `long_gap_segments`：最多 3 条紧凑空窗摘要，只包含 `duration_seconds`、`after`、`before`、`phase_guess`，文本有长度上限，不塞 raw 输出。
+- `root_cause_guess`：保守启发式，例如 `slow_startup_or_attach`、`slow_before_first_event`、`slow_context_reading`、`slow_before_first_change`、`slow_after_edit`、`slow_validation`、`no_event_noop`、`stalled_running`、`completed_normally` 或 `unknown`。
+
+这些 progress / root cause 字段只解释 wrapper 能观察到的进程输出、git snapshot 和有界 OpenCode event 摘要；它们是 heuristic，不代表能读取模型内部思考，也不能当作绝对根因。
 
 wrapper 还会把 OpenCode 写到 stdout 的 JSON lines 解析成有界 event 诊断信息。这些字段只用于观察，不会改变执行策略：
 
@@ -377,6 +441,15 @@ wrapper 不会因为这些字段自动 cancel、kill、回滚或清理文件。�
 
 `no_event_noop_risk` 和 stalled 是两类问题：此时进程已经 completed，wrapper 不会 cancel、kill，也不会自动重跑。direct run 且没有 session 复用参数、completed 但有真实 stdout JSON event / 文本输出、或有 `new_changed_files` 的 job 不应被标记为 no-op 风险。一旦出现该字段，应优先不传 `session_id` 重试，或新开 session/server，而不是只因 `status=completed` 就接受结果。
 
+session 复用诊断只基于当前 MCP 进程内存中仍可见的 job，重启后历史可能不可用：
+
+- `session_reuse_detected`、`session_reuse_mode`：当前 job 显式使用 `session_id`、`continue_last` 或 `fork_session` 时标记。
+- `same_session_recent_job_count`、`same_session_last_job_status`：只统计当前内存中可见的同 session job；不要求跨 MCP 重启准确。
+- `session_reuse_risk`、`session_reuse_note`：仅在有明显风险时置风险，例如 `no_event_noop_risk`、同 session 可见历史存在 working_dir 不一致、上一同 session job 异常结束等。`session_reuse_risk=false` 不等于绝对安全。
+- `likely_preexisting_from_same_session`、`likely_preexisting_same_session_files`：当前 job 的 preexisting dirty 路径与内存中可见的上一同 session job 改动路径有交集时给出提示；这是提示，不是证明。
+
+受控 session 复用建议：同一 `working_dir`、同一 feature/topic、上一 job 无 `no_event_noop_risk`、上一 job 无异常 terminal status、用户/FO 明确允许连续上下文，并且不跨 Unity 项目、不跨仓库根。
+
 active job 如果长时间没有 stdout/stderr 且没有文件变更，也可以被标记为 stalled；但由于没有观察到本 job 的文件改动，不会设置 `potential_incomplete_changes_risk`。
 
 failed、cancelled、timed_out 都不具备原子性；如果它们留下文件变更，必须 review `opencode_coder_diff`、本地 `git status` 和本地 `git diff`，再决定是否接受或继续处理当前工作区。
@@ -386,8 +459,10 @@ failed、cancelled、timed_out 都不具备原子性；如果它们留下文件�
 - `validation_status` 为 `not_run_by_wrapper`。
 - `validation_skipped_reason` 为 `not_run_by_wrapper`。
 - `validation_note` 会提醒调用方 wrapper 没有主动运行测试或验证。
+- `observed_validation_summary`、`observed_validation_tools`、`observed_validation_result`、`observed_validation_errors_count` 只描述从 OpenCode 工具执行信号中观察到的验证迹象，例如 bash/shell/command/test 工具事件或 Unity Skills 工具事件，不表示 wrapper 自己执行了验证。
 
 prompt 里要求 OpenCode 运行验证，不代表验证真的执行了。job 未 `completed` 时，prompt 内要求的验证很可能没有执行。调用方必须查看实际 stdout/stderr、OpenCode report 或本地验证结果。
+普通模型文本、README 内容、报告内容或普通 stdout 只是提到 `python -m py_compile`、`debug_check_compilation`、`git diff --check` 等命令时，不算验证执行。`read`、`open`、`grep`、`rg`、`search`、`glob`、`ls`、`get-childitem` 等读取/搜索/列表工具读到这些命令，也不算验证执行。`observed_validation_result` 没看到验证执行型工具活动时为 `none`；看到命令/工具但无法保守判断结果时为 `inconclusive`；能看到 Unity console `0 errors`、测试通过等明确标记时才为 `passed`；能看到失败或非零错误数时为 `failed`。同一观察窗口里同时存在 passed-looking 和 failed-looking 信号时，wrapper 优先返回 `failed` 或 `inconclusive`，避免误报 `passed`。
 
 ### `opencode_coder_diff`
 

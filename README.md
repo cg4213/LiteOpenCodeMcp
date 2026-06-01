@@ -123,8 +123,20 @@ surface, not as a raw terminal stream.
 - Reuse `server_id` by default, not `session_id`. Only pass `session_id`,
   `continue_last`, or `fork_session` when intentional conversation continuity is
   required. Do not reuse a session across different `working_dir` or repository roots.
+  Controlled session reuse is best limited to the same `working_dir`, same
+  feature/topic, a previous job without `no_event_noop_risk`, no abnormal previous
+  terminal status, and explicit user/feature-owner approval for continuous context.
+- Split large prompts into multiple bounded jobs. Prefer one clear delivery target per
+  OpenCode job, review the result, then dispatch the next step. This keeps long
+  reading/planning phases visible and easier to correct.
 - Prefer `wait_policy="start_only"` or `"first_output"` for long tasks, then poll with
   compact `opencode_coder_status(job_id, wait_seconds=...)`.
+- Use `caller_update_recommended`, `caller_update_reason`, and
+  `next_poll_after_seconds` to avoid noisy user updates. The first status poll should
+  usually wait 60-90 seconds after dispatch; follow-up polls can use
+  `next_poll_after_seconds` or a 45-90 second cadence. Normal running jobs can stay
+  silent while still reporting terminal statuses, first changes, stalls, policy
+  violations, validation sightings, and no-event no-op risk.
 - Do not request raw output in the normal polling loop. `include_tail`,
   `include_output`, and `include_delta` are debug switches and should be paired with
   explicit character caps when enabled.
@@ -247,6 +259,32 @@ Job results also include:
 - `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
+- `progress_phase`
+- `progress_message`
+- `caller_update_recommended`
+- `caller_update_reason`
+- `next_poll_after_seconds`
+- `time_to_first_output_seconds`
+- `time_to_first_event_seconds`
+- `time_to_first_tool_seconds`
+- `time_to_first_change_seconds`
+- `seconds_since_last_event`
+- `seconds_since_last_change`
+- `tool_activity_summary`
+- `long_gap_segments`
+- `root_cause_guess`
+- `session_reuse_detected`
+- `session_reuse_mode`
+- `session_reuse_risk`
+- `session_reuse_note`
+- `same_session_recent_job_count`
+- `same_session_last_job_status`
+- `likely_preexisting_from_same_session`
+- `likely_preexisting_same_session_files`
+- `observed_validation_summary`
+- `observed_validation_tools`
+- `observed_validation_result`
+- `observed_validation_errors_count`
 - `is_stalled`
 - `stall_reason`
 - `suggested_action`
@@ -352,6 +390,32 @@ Returns a structured result including:
 - `no_event_noop_reason`
 - `runtime_seconds`
 - `idle_seconds`
+- `progress_phase`
+- `progress_message`
+- `caller_update_recommended`
+- `caller_update_reason`
+- `next_poll_after_seconds`
+- `time_to_first_output_seconds`
+- `time_to_first_event_seconds`
+- `time_to_first_tool_seconds`
+- `time_to_first_change_seconds`
+- `seconds_since_last_event`
+- `seconds_since_last_change`
+- `tool_activity_summary`
+- `long_gap_segments`
+- `root_cause_guess`
+- `session_reuse_detected`
+- `session_reuse_mode`
+- `session_reuse_risk`
+- `session_reuse_note`
+- `same_session_recent_job_count`
+- `same_session_last_job_status`
+- `likely_preexisting_from_same_session`
+- `likely_preexisting_same_session_files`
+- `observed_validation_summary`
+- `observed_validation_tools`
+- `observed_validation_result`
+- `observed_validation_errors_count`
 - `is_stalled`
 - `stall_reason`
 - `suggested_action`
@@ -429,6 +493,35 @@ Every job result includes lightweight diagnostics:
   `continue_polling_or_consider_cancel`, `consider_cancel`,
   `review_diff_then_consider_cancel`, `review_diff_or_git_status`, or
   `check_session_or_retry_without_session`.
+- `progress_phase`: compact observable phase such as `starting`,
+  `waiting_first_output`, `reading_context`, `planning_or_reasoning`,
+  `long_context_or_planning`, `editing`, `validating`, `finalizing`, `stalled`,
+  `no_event_noop_risk`, `completed`, `failed`, `cancelled`, `timed_out`, or
+  `not_found`.
+- `progress_message`: short human-readable explanation. It never includes raw stdout,
+  large file content, or full event JSON.
+- `caller_update_recommended`, `caller_update_reason`,
+  `next_poll_after_seconds`: polling guidance for the caller. Normal running jobs
+  with recent ordinary activity should usually continue silent polling; terminal
+  statuses, policy violations, first observed changes, stalls, validation sightings,
+  long no-change planning, and no-event no-op risk are recommended update points.
+- `time_to_first_output_seconds`, `time_to_first_event_seconds`,
+  `time_to_first_tool_seconds`, `time_to_first_change_seconds`,
+  `seconds_since_last_event`, `seconds_since_last_change`: external timing
+  diagnostics. Missing observations are `null`, never `0`.
+- `tool_activity_summary`: compact read/edit/bash/list/unity/other counts based on
+  bounded observed tool events.
+- `long_gap_segments`: at most 3 compact gap summaries with `duration_seconds`,
+  `after`, `before`, and `phase_guess`; text is capped and does not carry raw output.
+- `root_cause_guess`: conservative heuristic such as `slow_startup_or_attach`,
+  `slow_before_first_event`, `slow_context_reading`, `slow_before_first_change`,
+  `slow_after_edit`, `slow_validation`, `no_event_noop`, `stalled_running`,
+  `completed_normally`, or `unknown`.
+
+These progress and root-cause fields describe externally observable wrapper events,
+git snapshots, and bounded OpenCode event summaries. They are heuristics; they do not
+read or reveal model-internal reasoning and should not be treated as absolute root
+cause analysis.
 
 The wrapper also parses stdout JSON lines from OpenCode into bounded event
 diagnostics. This is read-only observation; it does not change execution strategy:
@@ -490,6 +583,27 @@ stdout JSON events or text output, or jobs with `new_changed_files`. When it is
 reported, callers should retry without `session_id` or start a fresh session/server
 instead of accepting the result solely because `status=completed`.
 
+Session reuse diagnostics are memory-only and conservative:
+
+- `session_reuse_detected`, `session_reuse_mode`: set when the current job explicitly
+  used `session_id`, `continue_last`, or `fork_session`.
+- `same_session_recent_job_count`, `same_session_last_job_status`: based only on jobs
+  still visible in the current MCP server process. After a restart, history may be
+  unavailable.
+- `session_reuse_risk`, `session_reuse_note`: risk is set for clear signals such as
+  `no_event_noop_risk`, working-dir mismatch with visible same-session history, or a
+  previous same-session abnormal status. `session_reuse_risk=false` is not a guarantee
+  that reuse is safe.
+- `likely_preexisting_from_same_session`,
+  `likely_preexisting_same_session_files`: a hint that current preexisting dirty paths
+  overlap with paths changed by visible previous jobs in the same session. It is not
+  proof.
+
+Recommended controlled session reuse: same `working_dir`, same feature/topic, no
+previous `no_event_noop_risk`, no previous abnormal terminal status, explicit
+permission to preserve conversational context, and never across Unity projects or
+repository roots.
+
 An active job with no stdout/stderr and no file changes can still be marked stalled,
 but it does not set `potential_incomplete_changes_risk` because no job-scoped file
 change has been observed.
@@ -503,10 +617,27 @@ Validation fields are intentionally conservative:
 - `validation_status` is `not_run_by_wrapper`.
 - `validation_skipped_reason` is `not_run_by_wrapper`.
 - `validation_note` reminds callers that the wrapper did not run tests or validation.
+- `observed_validation_summary`, `observed_validation_tools`,
+  `observed_validation_result`, and `observed_validation_errors_count` describe
+  validation-like activity observed from OpenCode tool execution signals, such as
+  bash/shell/command/test tool events or Unity Skills tool events. They do not mean
+  the wrapper ran validation.
 
 A prompt asking OpenCode to run validation is not proof that validation ran. If the
 job is not `completed`, prompt-requested validation may not have run at all. Callers
 must inspect actual stdout/stderr, an OpenCode report, or local validation output.
+Plain model text, README content, reports, or ordinary stdout that merely mention
+commands such as `python -m py_compile`, `debug_check_compilation`, or
+`git diff --check` are not counted as validation execution without tool-execution
+context. Read/search/list tools such as `read`, `open`, `grep`, `rg`, `search`,
+`glob`, `ls`, or `get-childitem` also do not count as validation execution merely
+because their returned content contains validation commands. Observed validation
+returns `none` when no validation-like execution tool activity is seen,
+`inconclusive` when a command/tool is observed but the result cannot be read
+conservatively, `passed` only for clear passing markers such as Unity console
+`0 errors`, and `failed` for clear failure/error counts. If the same observation
+window contains both passing-looking and failing-looking signals, the wrapper prefers
+`failed` or `inconclusive` over reporting `passed`.
 
 ### `opencode_coder_diff`
 

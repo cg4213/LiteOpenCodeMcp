@@ -10,6 +10,7 @@
 2. Unity 资产操作不要用 opencode_coder，包括但不限于 prefab、scene、asset、ScriptableObject 资产写入、导入设置、材质、动画、UI prefab 层级等。
 3. 如果用户在当前任务里明确要求“使用 opencode_coder / opencode / MCP opencode / 让 OpenCode 执行”，则可以按用户要求使用；但如果涉及 Unity 资产操作，需要先提醒风险并确认边界。
 4. 不要把 opencode_coder 当成默认执行器。常规 review、方案讨论、提示词编写、需求拆解时不要调用它。
+5. 大工作提示词应先拆小。涉及多个文件、多条设计分支、迁移 + 验证 + 报告的任务，应拆成多个边界明确的 OpenCode job，逐步派发、逐步 review。
 
 推荐调用流程：
 1. 如当前会话还没暴露工具，先通过 tool_search 查找 LiteOpenCodeMcp / opencode_coder。
@@ -19,9 +20,10 @@
    - 派发任务时用 opencode_coder(..., server_id=..., wait_policy="start_only" 或 "first_output")。
    - 用 opencode_coder_status(job_id, wait_seconds=...) 轮询结果；默认 compact status 不返回长 tail、legacy output 或 stdout/stderr delta 正文。
    - 完成后用 opencode_coder_diff(job_id) 辅助 review。
-3. 默认复用 server_id，不默认复用 session_id。只有明确需要延续 OpenCode 会话上下文时才传 session_id、continue_last 或 fork_session；不要跨不同 working_dir 或不同仓库根目录复用 session_id。
+3. 默认复用 server_id，不默认复用 session_id。只有明确需要延续 OpenCode 会话上下文时才传 session_id、continue_last 或 fork_session；不要跨不同 working_dir 或不同仓库根目录复用 session_id。同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out，且用户或 FO 明确允许连续上下文时，可以受控复用 session_id 以减少重复读上下文。
 4. 小任务也可以直接用 opencode_coder，但仍必须检查返回结果。
 5. 普通轮询不要传 include_tail、include_output、include_delta。只有调试原始输出时才显式打开，并配合 tail_max_chars / delta_max_chars。
+6. 降低询问/汇报频率：派发 job 后第一次状态查询建议等 60-90 秒，后续优先按 next_poll_after_seconds 或 45-90 秒节奏轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
 
 强制检查要求：
 每次调用 opencode_coder / opencode_coder_status 后，必须检查返回内容，不能只看工具调用是否成功，也不能只看 status=completed 或 success=true。至少检查：
@@ -32,6 +34,8 @@
 - working_dir
 - exit_code
 - suggested_action
+- progress_phase / progress_message
+- caller_update_recommended / caller_update_reason / next_poll_after_seconds
 - summary
 - work_summary_text / assistant_last_text / last_text_output
 - new_changed_files
@@ -42,10 +46,16 @@
 - forbidden_changed_files
 - git_status_available / git_status_error
 - runtime_seconds / idle_seconds
+- time_to_first_output_seconds / time_to_first_event_seconds / time_to_first_tool_seconds / time_to_first_change_seconds
+- seconds_since_last_event / seconds_since_last_change
+- tool_activity_summary / long_gap_segments / root_cause_guess
 - is_stalled / stall_reason / suggested_action
 - review_required / incomplete_changes_risk / potential_incomplete_changes_risk / preexisting_dirty_warning
 - no_event_noop_risk / no_event_noop_reason
+- session_reuse_detected / session_reuse_mode / session_reuse_risk / session_reuse_note
+- same_session_recent_job_count / same_session_last_job_status / likely_preexisting_from_same_session
 - validation_status / validation_note
+- observed_validation_summary / observed_validation_tools / observed_validation_result / observed_validation_errors_count
 - stdout_cursor / stderr_cursor
 - attached_to_server / server_id / server_url
 
@@ -59,15 +69,23 @@ raw 输出规则：
 - 不要直接判断任务完成。
 - 必须继续用 opencode_coder_status(job_id, wait_seconds=...) 查询，直到 completed / failed / cancelled，或明确向用户说明仍在运行。
 - 必须检查 is_stalled、stall_reason、suggested_action；is_stalled 不是 failed，但表示应考虑查看 diff/status 后取消或继续轮询。
+- 默认用 caller_update_recommended / caller_update_reason 控制汇报频率；普通 running 且没有重大新信号时可以静默继续轮询。
 
 如果 no_event_noop_risk=true：
 - 不要把 completed / success=true 当成正常完成。
 - 优先不传 session_id 重试，或新开 session/server。
 - 最终回复必须说明这是 session 复用语义风险，而不是一次可信完成。
 
+如果 session_reuse_risk=true：
+- 必须说明 session 复用风险，例如 no-event no-op、同 session working_dir 不一致或上一同 session job 异常。
+- 即使 session_reuse_risk=false，也不能把复用视为绝对安全；history unavailable 时只能说明当前 wrapper 内存看不到足够历史。
+
 验证注意：
 - 不要假设 prompt 要求的验证一定执行了；wrapper 不主动运行验证。
 - validation_status / validation_note 只能说明 wrapper 的验证状态，不能替代 stdout/stderr、OpenCode report 或本地验证结果。
+- observed_validation_* 只是 wrapper 从 OpenCode 执行型工具信号中观察到的验证迹象，不改变 validation_status=not_run_by_wrapper；普通文本、README 内容、报告或 read/search/list 工具读到验证命令不等于验证执行。
+- observed_validation_result=inconclusive 或 none 时，必须按未可靠验证处理。
+- 即使 observed_validation_result=passed，也不能替代 FO/用户最终验证判断；如果存在 failed-looking 和 passed-looking 混杂信号，应按失败或不确定处理。
 - job 未 completed 时，prompt 内要求的验证很可能没有执行。
 
 如果有文件变更：
