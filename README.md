@@ -1,5 +1,7 @@
 # LiteOpenCodeMcp
 
+[中文说明](README.zh-CN.md)
+
 Lightweight MCP wrapper for running `opencode` as a coding agent from Codex.
 
 ## Tools
