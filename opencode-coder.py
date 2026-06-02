@@ -38,6 +38,12 @@ DEFAULT_WAIT_WAIT_SECONDS = DEFAULT_MAX_MCP_WAIT_SECONDS
 MAX_WAIT_WAIT_SECONDS = 600.0
 WAIT_POLL_INTERVAL = 0.5
 VALID_RETURN_ON = {"interesting", "terminal"}
+ONE_TIME_INTERESTING_REASONS = frozenset({
+    "first_change_seen",
+    "validation_observed",
+    "no_event_noop_risk",
+    "no_first_change_after_budget",
+})
 DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 MAX_FINISHED_JOBS = 100
 DEFAULT_DIFF_MAX_CHARS = 20_000
@@ -207,6 +213,7 @@ class OpenCodeJob:
     )
     observed_validation_tools: list[str] = field(default_factory=list)
     observed_validation_texts: deque[str] = field(default_factory=lambda: deque(maxlen=RECENT_EVENT_LIMIT))
+    reported_interesting_reasons: set[str] = field(default_factory=set)
     output_version: int = 0
     change_version: int = 0
     cancel_requested: bool = False
@@ -2335,6 +2342,17 @@ def wait_for_status_activity(job: OpenCodeJob, wait_seconds: float) -> None:
         time.sleep(min(0.1, remaining))
 
 
+def _is_novel_interesting_reason_locked(job: OpenCodeJob, reason: str) -> bool:
+    if reason not in ONE_TIME_INTERESTING_REASONS:
+        return True
+    return reason not in job.reported_interesting_reasons
+
+
+def _record_interesting_reason_locked(job: OpenCodeJob, reason: str) -> None:
+    if reason in ONE_TIME_INTERESTING_REASONS:
+        job.reported_interesting_reasons.add(reason)
+
+
 def wait_for_update(
     job: OpenCodeJob,
     wait_seconds: float,
@@ -2379,15 +2397,19 @@ def wait_for_update(
 
         result = job_to_result(job)
         if result["caller_update_recommended"]:
-            if result["caller_update_reason"] == "first_change_seen" and not _first_change_occurred(result):
+            reason = result["caller_update_reason"]
+            if reason == "first_change_seen" and not _first_change_occurred(result):
                 pass
             else:
-                waited = round(time.monotonic() - started_at, 3)
-                return {
-                    "wait_return_reason": result["caller_update_reason"],
-                    "interesting_update": True,
-                    "waited_seconds": waited,
-                }
+                with job.lock:
+                    if _is_novel_interesting_reason_locked(job, reason):
+                        _record_interesting_reason_locked(job, reason)
+                        waited = round(time.monotonic() - started_at, 3)
+                        return {
+                            "wait_return_reason": reason,
+                            "interesting_update": True,
+                            "waited_seconds": waited,
+                        }
 
         job.done_event.wait(min(WAIT_POLL_INTERVAL, max(remaining, 0)))
 
@@ -2401,12 +2423,18 @@ def wait_for_update(
             reason = "terminal_status"
         interesting = True
     elif final["caller_update_recommended"]:
-        if final["caller_update_reason"] == "first_change_seen" and not _first_change_occurred(final):
+        reason = final["caller_update_reason"]
+        if reason == "first_change_seen" and not _first_change_occurred(final):
             reason = "wait_timeout"
             interesting = False
         else:
-            reason = final["caller_update_reason"]
-            interesting = True
+            with job.lock:
+                if not _is_novel_interesting_reason_locked(job, reason):
+                    reason = "wait_timeout"
+                    interesting = False
+                else:
+                    _record_interesting_reason_locked(job, reason)
+                    interesting = True
     else:
         reason = "wait_timeout"
         interesting = False

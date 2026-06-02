@@ -543,6 +543,25 @@ def fake_command(
             "time.sleep(1.5)\n"
             "print(f'done {path}', flush=True)\n"
         )
+    elif prompt == "validation_bash_passed_then_sleep":
+        event = {
+            "type": "message.part.updated",
+            "sessionID": "ses_val_pass",
+            "messageID": "msg_val_pass",
+            "part": {
+                "type": "tool",
+                "name": "bash",
+                "status": "completed",
+                "text": "python -m py_compile target.py; 0 errors; all tests passed",
+            },
+        }
+        code = (
+            "import json\n"
+            "import time\n"
+            f"event = {event!r}\n"
+            "print(json.dumps(event), flush=True)\n"
+            "time.sleep(10)\n"
+        )
     else:
         raise AssertionError(f"unexpected prompt in fake command: {prompt}")
     return [sys.executable, "-c", code]
@@ -3401,6 +3420,100 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_return_reason"], "terminal_status")
         self.assertTrue(result["interesting_update"])
         self.assertFalse(result["needs_status_refresh"])
+
+    def test_wait_validation_observed_does_not_repeat(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "validation_bash_passed_then_sleep",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            result1 = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+            )
+            self.assertEqual(result1["wait_return_reason"], "validation_observed")
+            self.assertTrue(result1["interesting_update"])
+
+            started_at = time.monotonic()
+            result2 = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=0.5,
+                return_on="interesting",
+                include_status=False,
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertGreaterEqual(elapsed, 0.35)
+        self.assertEqual(result2["wait_return_reason"], "wait_timeout")
+        self.assertFalse(result2["interesting_update"])
+
+    def test_wait_start_only_first_change_does_not_repeat(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "write_then_sleep:src/first.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+                allowed_paths=["src"],
+            )
+            result1 = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+            )
+            self.assertEqual(result1["wait_return_reason"], "first_change_seen")
+            self.assertTrue(result1["interesting_update"])
+
+            started_at = time.monotonic()
+            result2 = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=0.5,
+                return_on="interesting",
+                include_status=False,
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertGreaterEqual(elapsed, 0.35)
+        self.assertEqual(result2["wait_return_reason"], "wait_timeout")
+        self.assertFalse(result2["interesting_update"])
+
+    def test_wait_terminal_status_still_returns_after_first_change_reported(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "write:src/final.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+                allowed_paths=["src"],
+            )
+            result1 = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+            )
+            self.assertEqual(result1["wait_return_reason"], "first_change_seen")
+            self.assertTrue(result1["interesting_update"])
+
+            result2 = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+            )
+
+        self.assertEqual(result2["wait_return_reason"], "terminal_status")
+        self.assertTrue(result2["interesting_update"])
+        self.assertEqual(result2["status"], "completed")
 
     def test_wait_policy_violation_guidance_prefers_diff_not_status(self):
         with tempfile.TemporaryDirectory() as working_dir:
