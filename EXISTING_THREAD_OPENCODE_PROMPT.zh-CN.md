@@ -10,7 +10,7 @@
 2. Unity 资产操作不要用 opencode_coder，包括但不限于 prefab、scene、asset、ScriptableObject 资产写入、导入设置、材质、动画、UI prefab 层级等。
 3. 如果用户在当前任务里明确要求“使用 opencode_coder / opencode / MCP opencode / 让 OpenCode 执行”，则可以按用户要求使用；但如果涉及 Unity 资产操作，需要先提醒风险并确认边界。
 4. 不要把 opencode_coder 当成默认执行器。常规 review、方案讨论、提示词编写、需求拆解时不要调用它。
-5. 大工作提示词应先拆小。涉及多个文件、多条设计分支、迁移 + 验证 + 报告的任务，应拆成多个边界明确的 OpenCode job，逐步派发、逐步 review。
+5. 大工作提示词必须小步快跑。涉及多个文件、多条设计分支、迁移 + 验证 + 报告的任务，应拆成多个边界明确的 OpenCode job；每轮只交付一个明确目标，完成后 review，再派发下一轮。
 
 推荐调用流程：
 1. 如当前会话还没暴露工具，先通过 tool_search 查找 LiteOpenCodeMcp / opencode_coder。
@@ -21,14 +21,15 @@
    - 派发后优先用 opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false) 等待关键变化；wait 返回 interesting 更新后，再用 opencode_coder_status(job_id) 获取完整诊断。
    - 如果 opencode_coder_wait 不可用，或需要 cursor/delta 诊断，再回退到 opencode_coder_status(job_id, wait_seconds=...)；默认 compact status 不返回长 tail、legacy output 或 stdout/stderr delta 正文。
    - 完成后用 opencode_coder_diff(job_id) 辅助 review。
-3. 默认复用 server_id，不默认复用 session_id。只有明确需要延续 OpenCode 会话上下文时才传 session_id、continue_last 或 fork_session；不要跨不同 working_dir 或不同仓库根目录复用 session_id。同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out，且用户或 FO 明确允许连续上下文时，可以受控复用 session_id 以减少重复读上下文。
+3. 默认复用 server_id。同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out 时，默认优先复用上一轮健康的 session_id，以减少重复读上下文；换任务主题、换 working_dir/仓库根、上一 job 异常或出现 no-op 风险时，必须新开 session。
 4. 小任务也可以直接用 opencode_coder，但仍必须检查返回结果。
 5. 普通轮询不要传 include_tail、include_output、include_delta。只有调试原始输出时才显式打开，并配合 tail_max_chars / delta_max_chars。
 6. 降低询问/汇报频率：派发 job 后第一次状态查询建议等 60-90 秒，后续优先用
    opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false) 等待关键变化；
    只有 wait 返回 interesting 更新时才调用 opencode_coder_status 获取完整诊断，替代频繁 status 查询。
-   如果 opencode_coder_wait 不可用，可回退到按 next_poll_after_seconds 或 45-90 秒节奏用
-   opencode_coder_status 轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现
+   如果 opencode_coder_wait 不可用，可回退到 45-90 秒节奏用 opencode_coder_status 轮询；
+   不要因为 next_poll_after_seconds=5/10 这类短建议就频繁追问或频繁向用户汇报；
+   只有 caller_update_recommended=true、状态终止、首次变更、风险出现
    或需要用户决策时才向用户汇报。
 
 强制检查要求：
@@ -77,6 +78,7 @@ raw 输出规则：
 - 必须继续用 opencode_coder_wait(..., include_status=false) 或 opencode_coder_status(job_id, wait_seconds=...) 查询，直到 completed / failed / cancelled，或明确向用户说明仍在运行。
 - 必须检查 is_stalled、stall_reason、suggested_action；is_stalled 不是 failed，但表示应考虑查看 diff/status 后取消或继续轮询。
 - 默认用 caller_update_recommended / caller_update_reason 控制汇报频率；普通 running 且没有重大新信号时可以静默继续轮询。
+- 如果 status 里出现 next_poll_after_seconds=5/10，只把它当作 status fallback 的内部诊断提示；正常调用优先继续使用 opencode_coder_wait，不要把它转成对用户的快速轮询汇报。
 
 如果 no_event_noop_risk=true：
 - 不要把 completed / success=true 当成正常完成。

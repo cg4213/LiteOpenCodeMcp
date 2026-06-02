@@ -110,9 +110,8 @@ python -B -m unittest -v test_opencode_coder.py
 
 推荐把 LiteOpenCodeMcp 当作“任务调度器 + 紧凑 review 面板”，不要当作会持续吐完整终端输出的同步命令。
 
-- 默认复用 `server_id`，不要默认复用 `session_id`。只有明确需要延续 OpenCode 会话上下文时才传 `session_id`、`continue_last` 或 `fork_session`；不要跨不同 `working_dir` 或不同仓库根目录复用 session。
-- 受控复用 session 的建议边界：同一 `working_dir`、同一 feature/topic、上一 job 没有 `no_event_noop_risk`、上一 job 没有异常 terminal status，并且用户或 Feature Owner 明确允许连续上下文；不要跨 Unity 项目或仓库根复用。
-- 大工作提示词应拆小成多步 job：每轮只交付一个明确目标，完成后 review 再派发下一轮，避免长时间卡在读取/规划阶段。
+- 默认复用 `server_id`。同一 `working_dir`、同一 feature/topic、上一 job 没有 `no_event_noop_risk`、上一 job 没有异常 terminal status 时，默认优先复用 `session_id`，以减少重复读取上下文；不同任务主题、不同仓库/Unity 项目、上一 job 异常或出现 no-op 风险时，不要复用 session。
+- 大工作提示词必须小步快跑：每个 OpenCode job 只交付一个明确目标，尽量避免把“多文件迁移 + 验证 + 文档 + 报告”塞进同一轮；完成后 review，再派发下一步。
 - 长任务优先使用 `wait_policy="start_only"` 或 `"first_output"`，让主对话尽快拿回控制权，
   再用 `opencode_coder_wait` 等待关键变化或 compact status 轮询。
 - 轮询时优先使用 `caller_update_recommended`、`caller_update_reason`、`next_poll_after_seconds`
@@ -120,7 +119,7 @@ python -B -m unittest -v test_opencode_coder.py
   `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)`
   只返回 `job_id`、`status` 和 wait 结果；当 wait 发现 interesting 更新（如 terminal、首次变更、
   stalled、policy violation）后，再按需调用 `opencode_coder_status` 获取完整诊断快照。
-  后续按 `next_poll_after_seconds` 或 45-90 秒节奏轮询；普通 running 且只有近期普通活动时可静默继续；
+  后续优先继续用 wait，而不是按 `next_poll_after_seconds=5/10` 这类短建议快速追问；`next_poll_after_seconds` 只作为 status fallback 的诊断参考。普通 running 且只有近期普通活动时可静默继续；
   terminal、首次变更、stalled、policy violation、验证观察、no-event no-op 风险等才值得汇报。
 - 普通轮询不要传 `include_tail`、`include_output`、`include_delta`。这些是调试开关，只有需要看原始 stdout/stderr 或 event 流时才打开，并配合字符上限。
 - 不要只因 `status=completed` 或 `success=true` 就接受结果。完成后必须看 `suggested_action`、`work_summary_text`、变更文件、path policy、stall/risk、`no_event_noop_risk` 和 validation 字段。
@@ -130,12 +129,13 @@ python -B -m unittest -v test_opencode_coder.py
 长任务推荐流程：
 
 1. 用 `opencode_server_start` 启动一个 managed OpenCode server。
-2. 用 `opencode_coder(..., server_id=..., wait_policy="start_only")` 派发任务，尽快拿到 `job_id`。
-3. 用 `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)` 轻量等待关键变化。
-4. wait 返回 `interesting_update=true` 后，再用 `opencode_coder_status(job_id)` 获取完整诊断；如果 wait 不可用或需要 cursor/delta 调试，再回退到 compact status 轮询。
-5. 用 `opencode_coder_diff(job_id)` 审查本 job 涉及的变更。
-6. 需要中止时调用 `opencode_coder_cancel(job_id)`。
-7. 新对话或 MCP 重启后，用 `opencode_server_list` 找回可复用的 managed server。
+2. 同一工作话题连续 job 默认带上上一轮健康完成的 `session_id`；换话题、换项目或上一轮有 no-op/失败/取消/超时风险时新开 session。
+3. 用 `opencode_coder(..., server_id=..., session_id=..., wait_policy="start_only")` 派发任务，尽快拿到 `job_id`。
+4. 用 `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)` 轻量等待关键变化。
+5. wait 返回 `interesting_update=true` 后，再用 `opencode_coder_status(job_id)` 获取完整诊断；如果 wait 不可用或需要 cursor/delta 调试，再回退到 compact status 轮询。
+6. 用 `opencode_coder_diff(job_id)` 审查本 job 涉及的变更。
+7. 需要中止时调用 `opencode_coder_cancel(job_id)`。
+8. 新对话或 MCP 重启后，用 `opencode_server_list` 找回可复用的 managed server。
 
 如果不传 `server_id`，`opencode_coder` 仍保持直接执行 `opencode run` 的兼容行为。
 

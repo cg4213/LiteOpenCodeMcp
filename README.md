@@ -120,15 +120,13 @@ surface, not as a raw terminal stream.
 
 - Prefer a managed OpenCode server: discover it with `opencode_server_list`, start one
   with `opencode_server_start` when needed, then pass `server_id` to `opencode_coder`.
-- Reuse `server_id` by default, not `session_id`. Only pass `session_id`,
-  `continue_last`, or `fork_session` when intentional conversation continuity is
-  required. Do not reuse a session across different `working_dir` or repository roots.
-  Controlled session reuse is best limited to the same `working_dir`, same
-  feature/topic, a previous job without `no_event_noop_risk`, no abnormal previous
-  terminal status, and explicit user/feature-owner approval for continuous context.
-- Split large prompts into multiple bounded jobs. Prefer one clear delivery target per
-  OpenCode job, review the result, then dispatch the next step. This keeps long
-  reading/planning phases visible and easier to correct.
+- Reuse `server_id` by default. For the same `working_dir` and same feature/topic,
+  reuse the previous healthy `session_id` by default to reduce repeated context
+  reading. Start a fresh session for a different topic/project, after failed /
+  cancelled / timed-out jobs, or after `no_event_noop_risk=true`.
+- Keep prompts small and iterative. Prefer one clear delivery target per OpenCode job,
+  review the result, then dispatch the next step. Avoid combining multi-file
+  migration, validation, documentation, and reporting into one large prompt.
 - Prefer `wait_policy="start_only"` or `"first_output"` for long tasks, then use
   `opencode_coder_wait` to block for meaningful changes or poll with compact
   `opencode_coder_status(job_id, wait_seconds=...)`.
@@ -138,10 +136,12 @@ surface, not as a raw terminal stream.
   include_status=false)` only returns `job_id`, `status`, and wait outcome fields.
   When the wait signals an interesting update (e.g. terminal status, first change,
   stall, policy violation), call `opencode_coder_status(job_id)` to get the full
-  diagnostic snapshot. Follow-up polls can use `next_poll_after_seconds` or a
-  45-90 second cadence. Normal running jobs can stay silent while still reporting
-  terminal statuses, first changes, stalls, policy violations, validation sightings,
-  and no-event no-op risk.
+  diagnostic snapshot. Continue with `opencode_coder_wait` for ordinary running
+  jobs; do not turn short `next_poll_after_seconds=5/10` hints into frequent user
+  updates. Treat `next_poll_after_seconds` as a status-fallback diagnostic hint, not
+  as the normal wait cadence. Normal running jobs can stay silent while still
+  reporting terminal statuses, first changes, stalls, policy violations, validation
+  sightings, and no-event no-op risk.
 - Do not request raw output in the normal polling loop. `include_tail`,
   `include_output`, and `include_delta` are debug switches and should be paired with
   explicit character caps when enabled.

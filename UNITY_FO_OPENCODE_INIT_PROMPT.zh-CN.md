@@ -40,17 +40,19 @@ OpenCode 不应主动手写、伪造或批量修改 Unity .meta 文件；.cs.met
    - 先 opencode_server_list 查看是否已有可复用 server。
    - 没有合适 server 时，用 opencode_server_start 启动。
    - 默认复用 server_id。
-   - 默认不要复用 session_id；只有明确需要延续 OpenCode 上下文时才传 session_id、continue_last 或 fork_session。
-   - 同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out，且用户或 FO 明确允许连续上下文时，可以受控复用 session_id 以减少重复读上下文。
+   - 同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out 时，默认优先复用上一轮健康的 session_id，以减少重复读上下文。
+   - 换任务主题、换 working_dir/仓库根、上一 job 异常或出现 no-op 风险时，必须新开 session；不要跨 Unity 项目复用 session。
    - 复用 server 前必须确认 working_dir 是本次目标项目/仓库路径；不要跨 Unity 项目复用 session。
 3. 派发任务时使用 opencode_coder，并优先设置 wait_policy 为 start_only 或 first_output。
 4. 使用 opencode_coder_wait / opencode_coder_status 观察任务，直到 completed / failed / cancelled；running / timed_out 不能当作完成。
    降低询问/汇报频率：派发后第一次状态查询建议等 60-90 秒，之后优先用 opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)
    等待关键变化，只有 wait 返回 interesting 更新时再调用 opencode_coder_status 获取完整诊断细节。
-   如果 opencode_coder_wait 不可用或已有 unread stdout/stderr cursor，可回退到按 next_poll_after_seconds 或 45-90 秒节奏用
-   opencode_coder_status 轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
+   如果 opencode_coder_wait 不可用或已有 unread stdout/stderr cursor，可回退到 45-90 秒节奏用
+   opencode_coder_status 轮询；不要因为 next_poll_after_seconds=5/10 这类短建议就频繁追问或频繁向用户汇报；
+   只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
 5. 普通轮询不要传 include_tail、include_output、include_delta；只有调试原始输出时才显式打开，并限制 tail_max_chars / delta_max_chars。
 6. 如果有文件变更，必须用 opencode_coder_diff 或本地 git diff review。
+7. 大工作提示词必须小步快跑：每轮只交付一个明确目标，避免把多文件迁移、验证、文档和报告塞进同一轮；每轮完成后先 review，再派发下一步。
 
 路径与权限：
 每次派发 OpenCode 任务都要明确：
@@ -86,6 +88,7 @@ allowed_paths / forbidden_paths 是变更审查和风险标记，不是强沙箱
 - 如果 no_event_noop_risk=true，不要把 completed / success=true 当成可信完成；优先不复用 session 重试，或新开 session/server。
 - 如果 session_reuse_risk=true，必须说明复用风险；即使 session_reuse_risk=false，也不要把 session 复用视为绝对安全。
 - 如果 caller_update_recommended=false，普通轮询可静默继续；如果为 true，应结合 caller_update_reason 判断是否向用户汇报。
+- 如果 status 里出现 next_poll_after_seconds=5/10，只把它当作 status fallback 的内部诊断提示；正常调用优先继续使用 opencode_coder_wait，不要把它转成对用户的快速轮询汇报。
 - 如果 opencode_coder_status(job_id) 返回 not_found，不要假设任务成功或失败；应检查 MCP server 是否重启、job registry 是否丢失，并用本地 git status / git diff 判断是否留下改动。
 - 如果 failed / cancelled / timed_out 后存在文件变更，也必须 review diff / git status。
 - 如果 opencode_coder_diff 返回 diff 不完整、undiffed_files、diff_command_errors 或 success=false，必须回退本地 git status / git diff 复核。
