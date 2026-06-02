@@ -156,10 +156,11 @@ surface, not as a raw terminal stream.
   stall, policy violation), call `opencode_coder_status(job_id)` to get the full
   diagnostic snapshot. Continue with `opencode_coder_wait` for ordinary running
   jobs. Normal status checks or user-facing updates should use a 120-second-or-longer
-  cadence; do not turn short `next_poll_after_seconds=5/10` hints into frequent user
-  updates. Treat `next_poll_after_seconds` as a status-fallback diagnostic hint, not
-  as the normal wait cadence. Normal running jobs can stay silent while still
-  reporting terminal statuses, first changes, stalls, policy violations, validation
+  cadence. `next_poll_after_seconds` for terminal/not_found/abnormal phases
+  defaults to `0`; ordinary running phases recommend `120`. Treat
+  `next_poll_after_seconds` as a status-fallback diagnostic hint, not as the
+  normal wait cadence. Normal running jobs can stay silent while still reporting
+  terminal statuses, first changes, stalls, policy violations, validation
   sightings, and no-event no-op risk.
 - Do not request raw output in the normal polling loop. `include_tail`,
   `include_output`, and `include_delta` are debug switches and should be paired with
@@ -706,7 +707,7 @@ meaningful change or the wait window expires. This reduces token waste from freq
 Parameters:
 
 - `job_id`: job returned by `opencode_coder`.
-- `wait_seconds`: maximum wait time, clamped to `0..600` seconds. Defaults to `90`.
+- `wait_seconds`: maximum wait time, clamped to `0..600` seconds. Defaults to `120`.
   The upper bound is conservative to avoid extreme MCP tool call timeouts while still
   allowing bulk polling. Longer waits should be split into multiple
   `opencode_coder_wait` calls or mixed with `opencode_coder_status` queries.

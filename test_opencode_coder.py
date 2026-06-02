@@ -2969,6 +2969,96 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(server.clamp_wait_wait_seconds(700), server.MAX_WAIT_WAIT_SECONDS)
         self.assertEqual(server.clamp_wait_wait_seconds("not-a-number"), server.DEFAULT_WAIT_WAIT_SECONDS)
         self.assertEqual(server.clamp_wait_wait_seconds(None), server.DEFAULT_WAIT_WAIT_SECONDS)
+        self.assertEqual(server.DEFAULT_WAIT_WAIT_SECONDS, 120.0)
+
+    def test_next_poll_after_seconds_no_short_poll_for_running_phases(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            status = server.opencode_coder_status(result["job_id"])
+            server.opencode_coder_cancel(result["job_id"])
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertIn(status["progress_phase"], {"starting", "waiting_first_output", "reading_context",
+                                                   "planning_or_reasoning", "editing", "validating",
+                                                   "finalizing", "long_context_or_planning"})
+        self.assertGreaterEqual(status["next_poll_after_seconds"], 120)
+
+    def test_next_poll_after_seconds_zero_for_terminal_and_not_found(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            failed = server.opencode_coder("fail", working_dir=working_dir, timeout_seconds=2)
+            not_found = server.opencode_coder_status("missing-job")
+
+        self.assertEqual(completed["next_poll_after_seconds"], 0)
+        self.assertEqual(failed["next_poll_after_seconds"], 0)
+        self.assertEqual(not_found["next_poll_after_seconds"], 0)
+
+    def test_next_poll_after_seconds_zero_for_timed_out(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder("no_output_long", working_dir=working_dir, timeout_seconds=0)
+            try:
+                self.assertEqual(result["next_poll_after_seconds"], 0)
+            finally:
+                server.opencode_coder_cancel(result["job_id"])
+
+    def test_next_poll_after_seconds_zero_for_stalled(self):
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_OUTPUT_SECONDS = 0.1
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                time.sleep(0.2)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["next_poll_after_seconds"], 0)
+
+    def test_next_poll_after_seconds_zero_for_policy_violation_during_non_terminal_phase(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write_then_sleep:forbidden.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                forbidden_paths=["forbidden.txt"],
+            )
+            try:
+                self.assertTrue(result["policy_violation"])
+                self.assertEqual(result["caller_update_reason"], "policy_violation")
+                self.assertIn(result["progress_phase"], {"editing", "validating"})
+                self.assertEqual(result["next_poll_after_seconds"], 0)
+            finally:
+                server.opencode_coder_cancel(result["job_id"])
+
+    def test_next_poll_after_seconds_120_for_first_change_seen(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "delayed_write:src/changed.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                allowed_paths=["src"],
+            )
+            final_status = wait_for_terminal_job(result["job_id"])
+
+        self.assertEqual(result["caller_update_reason"], "first_change_seen")
+        self.assertEqual(result["next_poll_after_seconds"], 120)
+        self.assertEqual(final_status["status"], "completed")
 
     def test_wait_does_not_break_existing_status(self):
         with tempfile.TemporaryDirectory() as working_dir:

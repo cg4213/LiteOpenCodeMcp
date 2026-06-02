@@ -122,7 +122,7 @@ python -B -m unittest -v test_opencode_coder.py
   `opencode_coder_wait(job_id, wait_seconds=120, return_on="interesting", include_status=false)`
   只返回 `job_id`、`status` 和 wait 结果；当 wait 发现 interesting 更新（如 terminal、首次变更、
   stalled、policy violation）后，再按需调用 `opencode_coder_status` 获取完整诊断快照。
-  后续优先继续用 wait；普通状态查询或向用户汇报的节奏默认不低于 120 秒，不要按 `next_poll_after_seconds=5/10` 这类短建议快速追问；`next_poll_after_seconds` 只作为 status fallback 的诊断参考。普通 running 且只有近期普通活动时可静默继续；
+  后续优先继续用 wait；普通状态查询或向用户汇报的节奏默认不低于 120 秒。`next_poll_after_seconds` 对 terminal/not_found/异常阶段默认为 `0`，对普通运行阶段建议 `120`，只作为 status fallback 的诊断参考，不要按短建议快速追问。普通 running 且只有近期普通活动时可静默继续；
   terminal、首次变更、stalled、policy violation、验证观察、no-event no-op 风险等才值得汇报。
 - 普通轮询不要传 `include_tail`、`include_output`、`include_delta`。这些是调试开关，只有需要看原始 stdout/stderr 或 event 流时才打开，并配合字符上限。
 - 不要只因 `status=completed` 或 `success=true` 就接受结果。完成后必须看 `suggested_action`、`work_summary_text`、变更文件、path policy、stall/risk、`no_event_noop_risk` 和 validation 字段。
@@ -495,7 +495,7 @@ prompt 里要求 OpenCode 运行验证，不代表验证真的执行了。job �
 参数：
 
 - `job_id`：`opencode_coder` 返回的 job id。
-- `wait_seconds`：最大等待秒数，限制在 `0..600` 秒，默认 `90`。上限保守，避免极端 MCP 工具调用超时。
+- `wait_seconds`：最大等待秒数，限制在 `0..600` 秒，默认 `120`。上限保守，避免极端 MCP 工具调用超时。
 - `return_on`：触发返回的事件类型：
   - `"interesting"`（默认）：等待 `caller_update_recommended=true`、terminal 状态、首次文件变更、policy violation、stalled、no_event_noop_risk、observed validation passed/failed 等任何值得关注的变化。超时时返回 `wait_timeout`。
   - `"terminal"`：只等待 `completed` / `failed` / `cancelled`。不把 running 或首次文件变更当作触发条件。

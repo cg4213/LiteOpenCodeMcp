@@ -32,7 +32,7 @@ DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_MAX_MCP_WAIT_SECONDS = 110.0
 DEFAULT_FINISHED_JOB_TTL_SECONDS = 3600.0
 MAX_STATUS_WAIT_SECONDS = 30.0
-DEFAULT_WAIT_WAIT_SECONDS = 90.0
+DEFAULT_WAIT_WAIT_SECONDS = 120.0
 MAX_WAIT_WAIT_SECONDS = 600.0
 WAIT_POLL_INTERVAL = 0.5
 VALID_RETURN_ON = {"interesting", "terminal"}
@@ -2245,9 +2245,16 @@ def wait_for_update(
     with job.lock:
         prev_change_version = job.change_version
 
+    was_zero_at_start = prev_change_version == 0
+
     deadline = time.monotonic() + wait_seconds
     started_at = time.monotonic()
     first_change_during_wait = False
+
+    def _first_change_occurred(result: dict) -> bool:
+        return first_change_during_wait or (
+            was_zero_at_start and bool(result.get("new_changed_files"))
+        )
 
     while True:
         remaining = deadline - time.monotonic()
@@ -2271,7 +2278,7 @@ def wait_for_update(
 
         result = job_to_result(job)
         if result["caller_update_recommended"]:
-            if result["caller_update_reason"] == "first_change_seen" and not first_change_during_wait:
+            if result["caller_update_reason"] == "first_change_seen" and not _first_change_occurred(result):
                 pass
             else:
                 waited = round(time.monotonic() - started_at, 3)
@@ -2287,13 +2294,13 @@ def wait_for_update(
     waited = round(time.monotonic() - started_at, 3)
 
     if final["status"] in {"completed", "failed", "cancelled"}:
-        if first_change_during_wait:
+        if _first_change_occurred(final):
             reason = "first_change_seen"
         else:
             reason = "terminal_status"
         interesting = True
     elif final["caller_update_recommended"]:
-        if final["caller_update_reason"] == "first_change_seen" and not first_change_during_wait:
+        if final["caller_update_reason"] == "first_change_seen" and not _first_change_occurred(final):
             reason = "wait_timeout"
             interesting = False
         else:
@@ -3043,16 +3050,16 @@ def build_progress_diagnostics_locked(
         "failed": 0,
         "cancelled": 0,
         "no_event_noop_risk": 0,
-        "timed_out": 10,
-        "stalled": 15,
-        "starting": 2,
-        "waiting_first_output": 5,
-        "reading_context": 10,
-        "planning_or_reasoning": 10,
-        "long_context_or_planning": 15,
-        "editing": 5,
-        "validating": 10,
-        "finalizing": 5,
+        "timed_out": 0,
+        "stalled": 0,
+        "starting": 120,
+        "waiting_first_output": 120,
+        "reading_context": 120,
+        "planning_or_reasoning": 120,
+        "long_context_or_planning": 120,
+        "editing": 120,
+        "validating": 120,
+        "finalizing": 120,
     }
     root_cause_guess = build_root_cause_guess(
         status=status,
@@ -3065,12 +3072,21 @@ def build_progress_diagnostics_locked(
         is_stalled=stall_diagnostics["is_stalled"],
         validation_observed=validation_observed,
     )
+    _next_poll_zero_reasons = {
+        "terminal_status",
+        "policy_violation",
+        "stalled",
+        "no_event_noop_risk",
+        "validation_observed",
+        "no_first_change_after_budget",
+        "not_found",
+    }
     return {
         "progress_phase": phase,
         "progress_message": compact_progress_message(message),
         "caller_update_recommended": caller_update_recommended,
         "caller_update_reason": caller_update_reason,
-        "next_poll_after_seconds": next_poll_by_phase.get(phase, 10),
+        "next_poll_after_seconds": 0 if caller_update_reason in _next_poll_zero_reasons else next_poll_by_phase.get(phase, 10),
         "root_cause_guess": root_cause_guess,
     }
 
@@ -4227,7 +4243,7 @@ def opencode_coder_wait(
     stalled、no_event_noop_risk、observed validation passed/failed 或 caller_update_recommended，
     或等待超时后再返回。
 
-    wait_seconds 会被限制在 0..600 秒。默认 90 秒。
+    wait_seconds 会被限制在 0..600 秒。默认 120 秒。
     return_on 默认 \"interesting\" 等待任何值得关注的变化；传 \"terminal\" 只等待 completed/failed/cancelled。
     include_status 默认 true，返回完整的 job 状态快照；传 false 只返回 wait 相关字段。
     include_tail/include_output/include_delta 是调试开关，默认 false 保持输出紧凑。
