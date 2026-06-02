@@ -487,6 +487,18 @@ def fake_command(
             "print(f'wrote {path}', flush=True)\n"
             "time.sleep(10)\n"
         )
+    elif prompt.startswith("write_then_brief_sleep:"):
+        path = prompt.split(":", 1)[1]
+        code = (
+            "import time\n"
+            "from pathlib import Path\n"
+            f"path = Path({path!r})\n"
+            "path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "path.write_text('generated\\n', encoding='utf-8')\n"
+            "print(f'wrote {path}', flush=True)\n"
+            "time.sleep(1.0)\n"
+            "print('all done', flush=True)\n"
+        )
     elif prompt.startswith("write_silent_then_sleep:"):
         path = prompt.split(":", 1)[1]
         code = (
@@ -2717,6 +2729,10 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["policy_violation"])
         self.assertEqual(result["extra_changed_files"], [])
         self.assertEqual(result["forbidden_changed_files"], [])
+        file_match = result["path_policy"]["file_matches"][0]
+        self.assertEqual(file_match["verdict"], "target")
+        self.assertIsNotNone(file_match["allowed_by"])
+        self.assertIsNone(file_match["allowed_side_effect_by"])
 
     def test_allowed_paths_reports_extra_changed_files(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -2728,9 +2744,10 @@ class OpenCodeCoderTests(unittest.TestCase):
                 allowed_paths=["src"],
             )
 
-        self.assertTrue(result["policy_violation"])
+        self.assertFalse(result["policy_violation"])
         self.assertEqual(result["extra_changed_files"], ["docs/outside.txt"])
         self.assertEqual(result["forbidden_changed_files"], [])
+        self.assertEqual(result["generated_or_unknown_files"], ["docs/outside.txt"])
         self.assertTrue(result["review_required"])
         self.assertFalse(result["incomplete_changes_risk"])
 
@@ -2794,7 +2811,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["policy_violation"])
         self.assertEqual(result["extra_changed_files"], [])
         file_match = result["path_policy"]["file_matches"][0]
-        self.assertEqual(file_match["verdict"], "allowed")
+        self.assertEqual(file_match["verdict"], "target")
         self.assertEqual(file_match["allowed_by"]["basis"], "git_relative_suffix")
 
     def test_allowed_paths_allows_project_relative_path_when_working_dir_is_subdir(self):
@@ -2854,6 +2871,157 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["new_changed_files"], [])
         self.assertFalse(result["policy_violation"])
 
+    def test_allowed_side_effect_paths_file_in_scope_no_violation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:docs/output.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_side_effect_paths=["docs"],
+            )
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["allowed_side_effect_files"], ["docs/output.txt"])
+        self.assertEqual(result["extra_changed_files"], [])
+        self.assertEqual(result["forbidden_changed_files"], [])
+        self.assertFalse(result["review_required"])
+        self.assertEqual(
+            result["path_policy"]["file_matches"][0]["verdict"],
+            "allowed_side_effect",
+        )
+        self.assertEqual(
+            result["path_policy"]["file_matches"][0].get("allowed_by"),
+            None,
+        )
+        side_by = result["path_policy"]["file_matches"][0]["allowed_side_effect_by"]
+        self.assertIsNotNone(side_by)
+        self.assertEqual(side_by["input"], "docs")
+        self.assertIn(side_by["basis"], {"abs_path", "git_root", "cwd", "working_dir"})
+        self.assertIn("path", side_by)
+
+    def test_side_effect_files_not_generated_or_unknown_when_allowed_paths_set(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:docs/output.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["src"],
+                allowed_side_effect_paths=["docs"],
+            )
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["allowed_side_effect_files"], ["docs/output.txt"])
+        self.assertEqual(result["generated_or_unknown_files"], [])
+        self.assertEqual(result["extra_changed_files"], [])
+        self.assertFalse(result["review_required"])
+        self.assertEqual(
+            result["path_policy"]["file_matches"][0]["verdict"],
+            "allowed_side_effect",
+        )
+        side_by = result["path_policy"]["file_matches"][0]["allowed_side_effect_by"]
+        self.assertIsNotNone(side_by)
+        self.assertEqual(side_by["input"], "docs")
+        self.assertIsNone(
+            result["path_policy"]["file_matches"][0].get("allowed_by"),
+        )
+
+    def test_generated_or_unknown_files_review_required_no_policy_violation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:extra/unexpected.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["src"],
+            )
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["generated_or_unknown_files"], ["extra/unexpected.txt"])
+        self.assertEqual(result["extra_changed_files"], ["extra/unexpected.txt"])
+        self.assertEqual(result["forbidden_changed_files"], [])
+        self.assertTrue(result["review_required"])
+        self.assertEqual(result["suggested_action"], "review_extra_files")
+
+    def test_python_bytecode_pyc_classified_review_required(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:lib/module.pyc",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["src"],
+            )
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(result["python_bytecode_files"], ["lib/module.pyc"])
+        self.assertEqual(result["known_generated_files"], ["lib/module.pyc"])
+        self.assertEqual(result["forbidden_changed_files"], [])
+        self.assertTrue(result["review_required"])
+        self.assertEqual(result["suggested_action"], "review_extra_files")
+        self.assertEqual(
+            result["path_policy"]["file_matches"][0]["verdict"],
+            "python_bytecode",
+        )
+
+    def test_pycache_dir_classified_as_python_bytecode(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:package/__pycache__/module.cpython-312.pyc",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["src"],
+            )
+        self.assertFalse(result["policy_violation"])
+        self.assertEqual(
+            result["python_bytecode_files"],
+            ["package/__pycache__/module.cpython-312.pyc"],
+        )
+        self.assertEqual(
+            result["known_generated_files"],
+            ["package/__pycache__/module.cpython-312.pyc"],
+        )
+        self.assertTrue(result["review_required"])
+        self.assertEqual(result["suggested_action"], "review_extra_files")
+        self.assertEqual(
+            result["path_policy"]["file_matches"][0]["verdict"],
+            "python_bytecode",
+        )
+
+    def test_forbidden_priority_over_pyc(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:__pycache__/bad.pyc",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_paths=["src"],
+                forbidden_paths=["__pycache__"],
+            )
+        self.assertTrue(result["policy_violation"])
+        self.assertEqual(result["forbidden_changed_files"], ["__pycache__/bad.pyc"])
+        self.assertEqual(result["python_bytecode_files"], [])
+        file_match = result["path_policy"]["file_matches"][0]
+        self.assertEqual(file_match["verdict"], "forbidden")
+        self.assertTrue(result["review_required"])
+
+    def test_forbidden_priority_over_side_effect(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write:docs/secret.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                allowed_side_effect_paths=["docs"],
+                forbidden_paths=["docs/secret.txt"],
+            )
+        self.assertTrue(result["policy_violation"])
+        self.assertEqual(result["forbidden_changed_files"], ["docs/secret.txt"])
+        self.assertEqual(result["allowed_side_effect_files"], [])
+        self.assertTrue(result["review_required"])
+        file_match = result["path_policy"]["file_matches"][0]
+        self.assertEqual(file_match["verdict"], "forbidden")
+        self.assertIsNone(file_match["allowed_side_effect_by"])
+        self.assertIsNotNone(file_match["forbidden_by"])
+
     def test_status_returns_final_policy_result_for_timed_out_job(self):
         with tempfile.TemporaryDirectory() as working_dir:
             init_git_repo(working_dir)
@@ -2867,8 +3035,9 @@ class OpenCodeCoderTests(unittest.TestCase):
             final_status = wait_for_terminal_job(initial["job_id"])
 
         self.assertEqual(final_status["status"], "completed")
-        self.assertTrue(final_status["policy_violation"])
-        self.assertEqual(final_status["extra_changed_files"], ["docs/outside.txt"])
+        self.assertFalse(final_status["policy_violation"])
+        self.assertEqual(final_status["generated_or_unknown_files"], ["docs/outside.txt"])
+        self.assertTrue(final_status["review_required"])
 
     def test_cancel_running_job_returns_cancelled_and_not_running(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -3326,6 +3495,181 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["next_poll_after_seconds"], 120)
         self.assertEqual(final_status["status"], "completed")
 
+    # ── suggested user wait guidance ──────────────────────────────────────────
+
+    def test_suggested_user_wait_seconds_zero_for_completed_failed_cancelled(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            failed = server.opencode_coder("fail", working_dir=working_dir, timeout_seconds=2)
+
+        self.assertEqual(completed["suggested_user_wait_seconds"], 0)
+        self.assertEqual(completed["suggested_wait_mode"], "none")
+        self.assertEqual(completed["suggested_wait_reason"], "completed")
+        self.assertEqual(failed["suggested_user_wait_seconds"], 0)
+        self.assertEqual(failed["suggested_wait_mode"], "none")
+        self.assertEqual(failed["suggested_wait_reason"], "failed")
+
+    def test_suggested_user_wait_seconds_zero_for_not_found(self):
+        result = server.opencode_coder_status("missing-job")
+        self.assertEqual(result["suggested_user_wait_seconds"], 0)
+        self.assertEqual(result["suggested_wait_mode"], "none")
+        self.assertEqual(result["suggested_wait_reason"], "not_found")
+        self.assertEqual(result["suggested_next_action"], "review_result")
+
+    def test_suggested_user_wait_seconds_zero_for_policy_violation(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "write_then_sleep:forbidden.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                forbidden_paths=["forbidden.txt"],
+            )
+            try:
+                self.assertTrue(result["policy_violation"])
+                self.assertEqual(result["suggested_user_wait_seconds"], 0)
+                self.assertEqual(result["suggested_wait_mode"], "none")
+                self.assertEqual(result["suggested_wait_reason"], "policy_violation")
+                self.assertEqual(result["suggested_next_action"], "review_policy_violation")
+            finally:
+                server.opencode_coder_cancel(result["job_id"])
+
+    def test_suggested_user_wait_seconds_zero_for_stalled(self):
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_OUTPUT_SECONDS = 0.1
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                time.sleep(0.2)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertTrue(status["is_stalled"])
+        self.assertEqual(status["suggested_user_wait_seconds"], 0)
+        self.assertEqual(status["suggested_wait_mode"], "none")
+        self.assertEqual(status["suggested_wait_reason"], "stalled")
+
+    def test_suggested_user_wait_seconds_zero_for_timed_out(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "no_output_long",
+                working_dir=working_dir,
+                timeout_seconds=0,
+            )
+            try:
+                self.assertEqual(result["suggested_user_wait_seconds"], 0)
+                self.assertEqual(result["suggested_wait_mode"], "none")
+                self.assertIn(result["suggested_wait_reason"], {"timed_out", "stalled"})
+            finally:
+                server.opencode_coder_cancel(result["job_id"])
+
+    def test_suggested_user_wait_seconds_at_least_120_for_waiting_first_output(self):
+        original_startup = server.PROGRESS_STARTUP_SECONDS
+        server.PROGRESS_STARTUP_SECONDS = 0.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.PROGRESS_STARTUP_SECONDS = original_startup
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["progress_phase"], "waiting_first_output")
+        self.assertGreaterEqual(status["suggested_user_wait_seconds"], 120)
+        self.assertEqual(status["suggested_wait_mode"], "external_sleep_then_status")
+        self.assertEqual(status["suggested_next_action"], "sleep_then_status")
+        self.assertEqual(status["suggested_wait_reason"], "awaiting_first_output")
+
+    def test_suggested_user_wait_seconds_180_for_reading_or_planning_no_change(self):
+        original_budget = server.NO_FIRST_CHANGE_BUDGET_SECONDS
+        original_no_activity = server.STALL_NO_ACTIVITY_SECONDS
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.NO_FIRST_CHANGE_BUDGET_SECONDS = 0.05
+        server.STALL_NO_ACTIVITY_SECONDS = 100.0
+        server.STALL_NO_OUTPUT_SECONDS = 100.0
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                result = server.opencode_coder(
+                    "read_event_then_sleep",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="first_output",
+                )
+                time.sleep(0.08)
+                status = server.opencode_coder_status(result["job_id"])
+                server.opencode_coder_cancel(result["job_id"])
+        finally:
+            server.NO_FIRST_CHANGE_BUDGET_SECONDS = original_budget
+            server.STALL_NO_ACTIVITY_SECONDS = original_no_activity
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertIn(status["status"], {"running", "timed_out"})
+        self.assertEqual(status["progress_phase"], "long_context_or_planning")
+        self.assertGreaterEqual(status["suggested_user_wait_seconds"], 180)
+        self.assertEqual(status["suggested_wait_mode"], "external_sleep_then_status")
+        self.assertEqual(status["suggested_next_action"], "sleep_then_status")
+        self.assertEqual(status["suggested_wait_reason"], "reading_or_planning_no_change")
+
+    def test_suggested_user_wait_seconds_240_for_first_change_seen_editing(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            result = server.opencode_coder(
+                "delayed_write:src/changed.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                allowed_paths=["src"],
+            )
+            final_status = wait_for_terminal_job(result["job_id"])
+
+        self.assertEqual(result["progress_phase"], "editing")
+        self.assertEqual(result["caller_update_reason"], "first_change_seen")
+        self.assertGreaterEqual(result["suggested_user_wait_seconds"], 240)
+        self.assertEqual(result["suggested_wait_mode"], "external_sleep_then_status")
+        self.assertEqual(result["suggested_next_action"], "sleep_then_status")
+        self.assertEqual(result["suggested_wait_reason"], "editing_in_progress")
+        self.assertEqual(final_status["status"], "completed")
+
+    def test_compact_wait_snapshot_includes_wait_guidance_fields(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "no_output_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            try:
+                result = server.opencode_coder_wait(
+                    initial["job_id"],
+                    wait_seconds=0.05,
+                    return_on="interesting",
+                    include_status=False,
+                )
+            finally:
+                server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertIn("suggested_user_wait_seconds", result)
+        self.assertIn("suggested_wait_mode", result)
+        self.assertIn("suggested_next_action", result)
+        self.assertIn("suggested_wait_reason", result)
+        self.assertIsInstance(result["suggested_user_wait_seconds"], int)
+        self.assertNotIn("stdout_tail", result)
+        self.assertNotIn("stderr_tail", result)
+
     def test_wait_does_not_break_existing_status(self):
         with tempfile.TemporaryDirectory() as working_dir:
             completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
@@ -3489,7 +3833,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as working_dir:
             init_git_repo(working_dir)
             initial = server.opencode_coder(
-                "write:src/final.txt",
+                "write_then_brief_sleep:src/final.txt",
                 working_dir=working_dir,
                 timeout_seconds=2,
                 wait_policy="start_only",
@@ -3503,17 +3847,20 @@ class OpenCodeCoderTests(unittest.TestCase):
             )
             self.assertEqual(result1["wait_return_reason"], "first_change_seen")
             self.assertTrue(result1["interesting_update"])
+            self.assertIn("src/final.txt", result1.get("new_changed_files", []))
 
             result2 = server.opencode_coder_wait(
                 initial["job_id"],
                 wait_seconds=2,
-                return_on="interesting",
+                return_on="terminal",
                 include_status=False,
             )
 
         self.assertEqual(result2["wait_return_reason"], "terminal_status")
         self.assertTrue(result2["interesting_update"])
         self.assertEqual(result2["status"], "completed")
+        self.assertTrue(result2["success"])
+        self.assertEqual(result2["exit_code"], 0)
 
     def test_wait_policy_violation_guidance_prefers_diff_not_status(self):
         with tempfile.TemporaryDirectory() as working_dir:

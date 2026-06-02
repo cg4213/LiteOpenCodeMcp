@@ -100,6 +100,11 @@ WAIT_COMPACT_SNAPSHOT_FIELDS = (
     "policy_violation",
     "extra_changed_files",
     "forbidden_changed_files",
+    "target_changed_files",
+    "allowed_side_effect_files",
+    "known_generated_files",
+    "python_bytecode_files",
+    "generated_or_unknown_files",
     "validation_status",
     "validation_note",
     "observed_validation_summary",
@@ -112,6 +117,10 @@ WAIT_COMPACT_SNAPSHOT_FIELDS = (
     "stall_reason",
     "no_event_noop_risk",
     "suggested_action",
+    "suggested_user_wait_seconds",
+    "suggested_wait_mode",
+    "suggested_next_action",
+    "suggested_wait_reason",
     "requested_model",
     "requested_variant",
     "requested_agent",
@@ -148,6 +157,7 @@ class OpenCodeJob:
     wait_policy: str = "completion"
     allowed_paths: list[str] | None = None
     forbidden_paths: list[str] | None = None
+    allowed_side_effect_paths: list[str] | None = None
     server_id: str | None = None
     server_url: str | None = None
     session_id: str | None = None
@@ -194,6 +204,11 @@ class OpenCodeJob:
     policy_violation: bool = False
     extra_changed_files: list[str] = field(default_factory=list)
     forbidden_changed_files: list[str] = field(default_factory=list)
+    target_changed_files: list[str] = field(default_factory=list)
+    allowed_side_effect_files: list[str] = field(default_factory=list)
+    known_generated_files: list[str] = field(default_factory=list)
+    python_bytecode_files: list[str] = field(default_factory=list)
+    generated_or_unknown_files: list[str] = field(default_factory=list)
     git_status_available: bool = False
     git_status_error: str | None = None
     git_root: str | None = None
@@ -1014,20 +1029,25 @@ def get_path_policy_summary(job: OpenCodeJob) -> dict:
     return {
         "allowed_paths": list(job.allowed_paths) if job.allowed_paths is not None else None,
         "forbidden_paths": list(job.forbidden_paths) if job.forbidden_paths is not None else None,
+        "allowed_side_effect_paths": list(job.allowed_side_effect_paths) if job.allowed_side_effect_paths is not None else None,
         "checked_files_basis": "new_changed_files",
         "working_dir": diagnostics.get("working_dir", trim_diagnostic_text(job.working_dir)),
         "git_root": diagnostics.get("git_root", trim_diagnostic_text(job.git_root)),
         "git_root_error": diagnostics.get("git_root_error", trim_diagnostic_text(job.git_root_error)),
         "allowed_paths_normalized": diagnostics.get("allowed_paths_normalized", []),
         "forbidden_paths_normalized": diagnostics.get("forbidden_paths_normalized", []),
+        "allowed_side_effect_paths_normalized": diagnostics.get("allowed_side_effect_paths_normalized", []),
         "checked_files_count": diagnostics.get("checked_files_count", 0),
         "file_matches": diagnostics.get("file_matches", []),
         "file_matches_truncated": diagnostics.get("file_matches_truncated", False),
+        "known_generated_files": list(job.known_generated_files),
+        "python_bytecode_files": list(job.python_bytecode_files),
         "match_rule": (
             "forbidden paths are checked first; exact path or descendant path matches; "
             "git status paths are treated as git-root-relative when git_root is available; "
             "relative policy paths are tried relative to working_dir and git_root; "
-            "multi-component relative policy paths may also match a git-relative suffix"
+            "multi-component relative policy paths may also match a git-relative suffix; "
+            "python bytecode files (*.pyc, __pycache__/**) are auto-classified as known_generated"
         ),
         "case_sensitive": os.name != "nt",
     }
@@ -2113,6 +2133,17 @@ def truncate_diff(diff: str, max_chars: int) -> tuple[str, bool]:
     return diff[:max_chars], True
 
 
+def is_python_bytecode_file(path: str) -> bool:
+    normalized = normalize_git_path(path)
+    key = git_path_key(normalized)
+    if key.endswith(".pyc"):
+        return True
+    parts = [part.casefold() if os.name == "nt" else part for part in normalized.split("/")]
+    if "__pycache__" in parts:
+        return True
+    return False
+
+
 def evaluate_path_policy(
     working_dir: str,
     git_root: str | None,
@@ -2120,25 +2151,45 @@ def evaluate_path_policy(
     new_changed_files: list[str],
     allowed_paths: list[str] | None,
     forbidden_paths: list[str] | None,
-) -> tuple[bool, list[str], list[str], dict]:
+    allowed_side_effect_paths: list[str] | None = None,
+) -> dict:
     allowed = [path for path in list(allowed_paths or []) if str(path).strip()]
     forbidden = [path for path in list(forbidden_paths or []) if str(path).strip()]
+    allowed_side = [path for path in list(allowed_side_effect_paths or []) if str(path).strip()]
     forbidden_changed_files: list[str] = []
-    extra_changed_files: list[str] = []
+    target_changed_files: list[str] = []
+    allowed_side_effect_files: list[str] = []
+    known_generated_files: list[str] = []
+    python_bytecode_files: list[str] = []
+    generated_or_unknown_files: list[str] = []
     file_matches: list[dict] = []
 
     for changed_file in new_changed_files:
+        is_pyc = is_python_bytecode_file(changed_file)
+
         forbidden_match = first_path_policy_match(working_dir, git_root, changed_file, forbidden)
-        allowed_match = first_path_policy_match(working_dir, git_root, changed_file, allowed)
+        allowed_match = first_path_policy_match(working_dir, git_root, changed_file, allowed) if allowed else None
+        allowed_side_match = first_path_policy_match(working_dir, git_root, changed_file, allowed_side) if allowed_side else None
 
         if forbidden_match is not None:
             forbidden_changed_files.append(changed_file)
             verdict = "forbidden"
+        elif allowed_match is not None:
+            target_changed_files.append(changed_file)
+            verdict = "target"
+        elif allowed_side_match is not None:
+            allowed_side_effect_files.append(changed_file)
+            verdict = "allowed_side_effect"
+        elif is_pyc:
+            python_bytecode_files.append(changed_file)
+            known_generated_files.append(changed_file)
+            verdict = "python_bytecode"
         elif allowed and allowed_match is None:
-            extra_changed_files.append(changed_file)
-            verdict = "extra"
+            generated_or_unknown_files.append(changed_file)
+            verdict = "generated_or_unknown"
         else:
-            verdict = "allowed"
+            target_changed_files.append(changed_file)
+            verdict = "target"
 
         if len(file_matches) < MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES:
             file_matches.append(
@@ -2147,10 +2198,11 @@ def evaluate_path_policy(
                     "verdict": verdict,
                     "allowed_by": allowed_match,
                     "forbidden_by": forbidden_match,
+                    "allowed_side_effect_by": allowed_side_match if verdict == "allowed_side_effect" else None,
                 }
             )
 
-    policy_violation = bool(forbidden_changed_files or extra_changed_files)
+    policy_violation = bool(forbidden_changed_files)
     diagnostics = {
         "working_dir": trim_diagnostic_text(working_dir),
         "git_root": trim_diagnostic_text(git_root),
@@ -2159,10 +2211,20 @@ def evaluate_path_policy(
         "checked_files_count": len(new_changed_files),
         "allowed_paths_normalized": normalize_policy_paths_for_diagnostics(working_dir, git_root, allowed),
         "forbidden_paths_normalized": normalize_policy_paths_for_diagnostics(working_dir, git_root, forbidden),
+        "allowed_side_effect_paths_normalized": normalize_policy_paths_for_diagnostics(working_dir, git_root, allowed_side),
         "file_matches": file_matches,
         "file_matches_truncated": len(new_changed_files) > MAX_PATH_POLICY_DIAGNOSTIC_ENTRIES,
     }
-    return policy_violation, extra_changed_files, forbidden_changed_files, diagnostics
+    return {
+        "policy_violation": policy_violation,
+        "target_changed_files": target_changed_files,
+        "allowed_side_effect_files": allowed_side_effect_files,
+        "known_generated_files": known_generated_files,
+        "python_bytecode_files": python_bytecode_files,
+        "generated_or_unknown_files": generated_or_unknown_files,
+        "forbidden_changed_files": forbidden_changed_files,
+        "path_policy_diagnostics": diagnostics,
+    }
 
 
 def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_preexisting: bool = False) -> None:
@@ -2195,13 +2257,14 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
             for key in changed_during_job_keys
         }
         previous_change_fingerprints = dict(job.observed_change_fingerprints)
-        policy_violation, extra_changed_files, forbidden_changed_files, path_policy_diagnostics = evaluate_path_policy(
+        policy_result = evaluate_path_policy(
             job.working_dir,
             snapshot.git_root,
             snapshot.git_root_error,
             new_changed_files,
             job.allowed_paths,
             job.forbidden_paths,
+            job.allowed_side_effect_paths,
         )
 
         job.all_changed_files = all_changed_files
@@ -2217,14 +2280,19 @@ def apply_git_snapshot(job: OpenCodeJob, snapshot: GitStatusSnapshot, *, set_pre
                 job.last_trusted_change_activity_at = now
             job.change_version += 1
             job.change_event.set()
-        job.policy_violation = policy_violation
-        job.extra_changed_files = extra_changed_files
-        job.forbidden_changed_files = forbidden_changed_files
+        job.policy_violation = policy_result["policy_violation"]
+        job.extra_changed_files = policy_result["generated_or_unknown_files"]
+        job.forbidden_changed_files = policy_result["forbidden_changed_files"]
+        job.target_changed_files = policy_result["target_changed_files"]
+        job.allowed_side_effect_files = policy_result["allowed_side_effect_files"]
+        job.known_generated_files = policy_result["known_generated_files"]
+        job.python_bytecode_files = policy_result["python_bytecode_files"]
+        job.generated_or_unknown_files = policy_result["generated_or_unknown_files"]
         job.git_status_available = snapshot.available
         job.git_status_error = snapshot.error
         job.git_root = snapshot.git_root
         job.git_root_error = snapshot.git_root_error
-        job.path_policy_diagnostics = path_policy_diagnostics
+        job.path_policy_diagnostics = policy_result["path_policy_diagnostics"]
         job.last_git_snapshot_at = now
 
 
@@ -2558,6 +2626,8 @@ def build_stall_diagnostics(
         suggested_action = "review_diff_or_git_status"
     elif status == "completed" and job.policy_violation:
         suggested_action = "review_policy_violation"
+    elif status == "completed" and (job.generated_or_unknown_files or job.known_generated_files):
+        suggested_action = "review_extra_files"
     elif status == "completed":
         suggested_action = "review_result"
     else:
@@ -2573,9 +2643,10 @@ def build_stall_diagnostics(
 
 def build_change_risk_fields(job: OpenCodeJob, status: str) -> dict:
     has_new_changes = bool(job.new_changed_files)
+    has_extra_files = bool(job.generated_or_unknown_files or job.known_generated_files)
     review_required = (
         ((status in ACTIVE_STATUSES or status in {"failed", "cancelled"}) and has_new_changes)
-        or (status == "completed" and job.policy_violation)
+        or (status == "completed" and (job.policy_violation or has_extra_files))
     )
     incomplete_changes_risk = status in {"failed", "cancelled", "timed_out"} and has_new_changes
     if job.preexisting_changed_files:
@@ -3154,6 +3225,9 @@ def build_progress_diagnostics_locked(
     elif job.policy_violation:
         caller_update_recommended = True
         caller_update_reason = "policy_violation"
+    elif status == "completed" and (job.generated_or_unknown_files or job.known_generated_files):
+        caller_update_recommended = True
+        caller_update_reason = "extra_files_detected"
     elif stall_diagnostics["is_stalled"]:
         caller_update_recommended = True
         caller_update_reason = "stalled"
@@ -3204,12 +3278,78 @@ def build_progress_diagnostics_locked(
     _next_poll_zero_reasons = {
         "terminal_status",
         "policy_violation",
+        "extra_files_detected",
         "stalled",
         "no_event_noop_risk",
         "validation_observed",
         "no_first_change_after_budget",
         "not_found",
     }
+    # ── suggested user wait guidance ──────────────────────────────────────────
+    has_changes = bool(job.new_changed_files or job.all_changed_files)
+    needs_review = has_changes or bool(job.generated_or_unknown_files or job.known_generated_files)
+
+    if no_event_noop_diagnostics["no_event_noop_risk"]:
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "review_result"
+        suggested_wait_reason = "no_event_noop_risk"
+    elif job.policy_violation:
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "review_policy_violation"
+        suggested_wait_reason = "policy_violation"
+    elif stall_diagnostics["is_stalled"]:
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "diagnose_or_cancel"
+        suggested_wait_reason = "stalled"
+    elif status == "failed":
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "review_result"
+        suggested_wait_reason = "failed"
+    elif status == "cancelled":
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "review_result"
+        suggested_wait_reason = "cancelled"
+    elif status == "timed_out":
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "diagnose_or_cancel"
+        suggested_wait_reason = "timed_out"
+    elif status == "completed":
+        suggested_user_wait_seconds = 0
+        suggested_wait_mode = "none"
+        suggested_next_action = "review_diff" if has_changes else "review_result"
+        suggested_wait_reason = "completed"
+    elif phase == "starting" or phase == "waiting_first_output":
+        suggested_user_wait_seconds = 120
+        suggested_wait_mode = "external_sleep_then_status"
+        suggested_next_action = "sleep_then_status"
+        suggested_wait_reason = "awaiting_first_output"
+    elif phase == "validating":
+        suggested_user_wait_seconds = 120
+        suggested_wait_mode = "external_sleep_then_status"
+        suggested_next_action = "sleep_then_status"
+        suggested_wait_reason = "validation_in_progress"
+    elif phase in {"reading_context", "long_context_or_planning", "planning_or_reasoning"}:
+        suggested_user_wait_seconds = 180
+        suggested_wait_mode = "external_sleep_then_status"
+        suggested_next_action = "sleep_then_status"
+        suggested_wait_reason = "reading_or_planning_no_change"
+    elif phase in {"editing", "finalizing"}:
+        suggested_user_wait_seconds = 240
+        suggested_wait_mode = "external_sleep_then_status"
+        suggested_next_action = "sleep_then_status"
+        suggested_wait_reason = "editing_in_progress"
+    else:
+        suggested_user_wait_seconds = 120
+        suggested_wait_mode = "external_sleep_then_status"
+        suggested_next_action = "sleep_then_status"
+        suggested_wait_reason = "unknown_phase_default"
+
     return {
         "progress_phase": phase,
         "progress_message": compact_progress_message(message),
@@ -3217,6 +3357,10 @@ def build_progress_diagnostics_locked(
         "caller_update_reason": caller_update_reason,
         "next_poll_after_seconds": 0 if caller_update_reason in _next_poll_zero_reasons else next_poll_by_phase.get(phase, 10),
         "root_cause_guess": root_cause_guess,
+        "suggested_user_wait_seconds": suggested_user_wait_seconds,
+        "suggested_wait_mode": suggested_wait_mode,
+        "suggested_next_action": suggested_next_action,
+        "suggested_wait_reason": suggested_wait_reason,
     }
 
 
@@ -3485,6 +3629,11 @@ def job_to_result(
             "policy_violation": job.policy_violation,
             "extra_changed_files": list(job.extra_changed_files),
             "forbidden_changed_files": list(job.forbidden_changed_files),
+            "target_changed_files": list(job.target_changed_files),
+            "allowed_side_effect_files": list(job.allowed_side_effect_files),
+            "known_generated_files": list(job.known_generated_files),
+            "python_bytecode_files": list(job.python_bytecode_files),
+            "generated_or_unknown_files": list(job.generated_or_unknown_files),
             "path_policy": get_path_policy_summary(job),
             "git_status_available": job.git_status_available,
             "git_status_error": job.git_status_error,
@@ -3521,6 +3670,10 @@ def job_to_result(
             "tool_activity_summary": tool_activity_summary,
             "long_gap_segments": long_gap_segments,
             "root_cause_guess": progress_diagnostics["root_cause_guess"],
+            "suggested_user_wait_seconds": progress_diagnostics["suggested_user_wait_seconds"],
+            "suggested_wait_mode": progress_diagnostics["suggested_wait_mode"],
+            "suggested_next_action": progress_diagnostics["suggested_next_action"],
+            "suggested_wait_reason": progress_diagnostics["suggested_wait_reason"],
             "session_reuse_detected": session_reuse_diagnostics["session_reuse_detected"],
             "session_reuse_mode": session_reuse_diagnostics["session_reuse_mode"],
             "session_reuse_risk": session_reuse_diagnostics["session_reuse_risk"],
@@ -3610,6 +3763,11 @@ def make_job_not_found_result(job_id: str) -> dict:
         "policy_violation": False,
         "extra_changed_files": [],
         "forbidden_changed_files": [],
+        "target_changed_files": [],
+        "allowed_side_effect_files": [],
+        "known_generated_files": [],
+        "python_bytecode_files": [],
+        "generated_or_unknown_files": [],
         "path_policy": None,
         "git_status_available": False,
         "git_status_error": "job_not_found",
@@ -3646,6 +3804,10 @@ def make_job_not_found_result(job_id: str) -> dict:
         "tool_activity_summary": {category: 0 for category in TOOL_ACTIVITY_CATEGORIES},
         "long_gap_segments": [],
         "root_cause_guess": "unknown",
+        "suggested_user_wait_seconds": 0,
+        "suggested_wait_mode": "none",
+        "suggested_next_action": "review_result",
+        "suggested_wait_reason": "not_found",
         "session_reuse_detected": False,
         "session_reuse_mode": "none",
         "session_reuse_risk": False,
@@ -3721,6 +3883,7 @@ def make_start_failed_result(
     wait_policy: str,
     allowed_paths: list[str] | None,
     forbidden_paths: list[str] | None,
+    allowed_side_effect_paths: list[str] | None = None,
     server_id: str | None,
     server_url: str | None,
     session_id: str | None,
@@ -3746,6 +3909,7 @@ def make_start_failed_result(
         wait_policy=wait_policy,
         allowed_paths=allowed_paths,
         forbidden_paths=forbidden_paths,
+        allowed_side_effect_paths=allowed_side_effect_paths,
         server_id=server_id,
         server_url=server_url,
         session_id=session_id,
@@ -3777,6 +3941,7 @@ def start_job(
     allow_concurrent: bool,
     allowed_paths: list[str] | None,
     forbidden_paths: list[str] | None,
+    allowed_side_effect_paths: list[str] | None,
     wait_policy: str | None,
     server_id: str | None,
     session_id: str | None,
@@ -3827,6 +3992,7 @@ def start_job(
                 wait_policy=normalized_wait_policy,
                 allowed_paths=allowed_paths,
                 forbidden_paths=forbidden_paths,
+                allowed_side_effect_paths=allowed_side_effect_paths,
                 server_id=server_id,
                 server_url=None,
                 session_id=session_id,
@@ -3869,6 +4035,51 @@ def start_job(
                 wait_policy=normalized_wait_policy,
                 allowed_paths=allowed_paths,
                 forbidden_paths=forbidden_paths,
+                allowed_side_effect_paths=allowed_side_effect_paths,
+                server_id=server_id,
+                server_url=server.url,
+                session_id=session_id,
+                continue_last=continue_last,
+                fork_session=fork_session,
+                attached_to_server=True,
+                error=f"server_id is not running: {server_id}",
+                server_recovered_from_registry=server.recovered_from_registry,
+                model=model,
+                variant=variant,
+                agent=agent,
+                show_thinking=show_thinking,
+            )
+            return None, result
+
+        refresh_server_status(server)
+        if not is_server_running(server):
+            result = make_start_failed_result(
+                working_dir=resolved_working_dir,
+                cwd_key=cwd_key,
+                command=build_opencode_command(
+                    prompt,
+                    working_dir=resolved_working_dir,
+                    server_url=server.url,
+                    session_id=session_id,
+                    continue_last=continue_last,
+                    fork_session=fork_session,
+                    title=title,
+                    model=model,
+                    variant=variant,
+                    agent=agent,
+                    show_thinking=show_thinking,
+                ),
+                command_summary=(
+                    f"{Path(resolve_opencode()).name} run --attach {server.url} "
+                    f"<server not running> <prompt chars={len(prompt)}>"
+                ),
+                requested_timeout_seconds=requested_timeout,
+                effective_timeout_seconds=effective_timeout,
+                timeout_policy=timeout_policy,
+                wait_policy=normalized_wait_policy,
+                allowed_paths=allowed_paths,
+                forbidden_paths=forbidden_paths,
+                allowed_side_effect_paths=allowed_side_effect_paths,
                 server_id=server_id,
                 server_url=server.url,
                 session_id=session_id,
@@ -3914,6 +4125,7 @@ def start_job(
             wait_policy=normalized_wait_policy,
             allowed_paths=allowed_paths,
             forbidden_paths=forbidden_paths,
+            allowed_side_effect_paths=allowed_side_effect_paths,
             server_id=server_id,
             server_url=server_url,
             session_id=session_id,
@@ -3956,6 +4168,7 @@ def start_job(
             wait_policy=normalized_wait_policy,
             allowed_paths=allowed_paths,
             forbidden_paths=forbidden_paths,
+            allowed_side_effect_paths=allowed_side_effect_paths,
             server_id=server_id,
             server_url=server_url,
             session_id=session_id,
@@ -4254,6 +4467,7 @@ def opencode_coder(
     allow_concurrent: bool = False,
     allowed_paths: list[str] | None = None,
     forbidden_paths: list[str] | None = None,
+    allowed_side_effect_paths: list[str] | None = None,
     wait_policy: str = "completion",
     server_id: str | None = None,
     session_id: str | None = None,
@@ -4279,6 +4493,7 @@ def opencode_coder(
         allow_concurrent,
         allowed_paths,
         forbidden_paths,
+        allowed_side_effect_paths,
         wait_policy,
         server_id,
         session_id,
@@ -4434,7 +4649,7 @@ def wait_status_refresh_reason(
     if wait_reason == "first_change_seen" and not status_result.get("new_changed_files"):
         return "first_change_without_snapshot_files"
     if status_result.get("policy_violation") and not (
-        status_result.get("extra_changed_files") or status_result.get("forbidden_changed_files")
+        status_result.get("forbidden_changed_files")
     ):
         return "policy_violation_without_file_details"
     if status_result.get("is_stalled") and not status_result.get("stall_reason"):
@@ -4457,6 +4672,8 @@ def wait_suggested_next_tool(status_result: dict, wait_info: dict, needs_status_
     if status == "not_found":
         return "none"
     if status_result.get("policy_violation") or wait_reason == "policy_violation":
+        return "opencode_coder_diff"
+    if wait_reason == "extra_files_detected":
         return "opencode_coder_diff"
     if status_result.get("no_event_noop_risk"):
         return "opencode_coder"
