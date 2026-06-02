@@ -120,24 +120,43 @@ surface, not as a raw terminal stream.
 
 - Prefer a managed OpenCode server: discover it with `opencode_server_list`, start one
   with `opencode_server_start` when needed, then pass `server_id` to `opencode_coder`.
-- Reuse `server_id` by default. For the same `working_dir` and same feature/topic,
-  reuse the previous healthy `session_id` by default to reduce repeated context
-  reading. Start a fresh session for a different topic/project, after failed /
-  cancelled / timed-out jobs, or after `no_event_noop_risk=true`.
+- Reuse `server_id` by default. Session reuse is meant to reduce repeated context
+  reading and token cost; it is not a safety mechanism. For the same `working_dir`
+  and same feature/topic, prioritize reusing the previous healthy `session_id` when the
+  previous job was `completed/success`, had no `no_event_noop_risk`, had no abnormal
+  terminal status, and showed no obvious misunderstanding or incomplete changes.
+- Consecutive small review fixes in the same phase are good candidates for session
+  reuse. Across phase boundaries, re-evaluate instead of mechanically forbidding or
+  mechanically reusing the session: if the task is still the same tool/code topic,
+  context is continuous, and the risk boundary did not materially change, reuse is
+  acceptable, but the prompt must restate the target, allowed paths, and forbidden
+  paths. Start a fresh session when the task type, allowed paths, or risk boundary
+  changes materially.
+- Never reuse a session across `working_dir` values, repository roots, or Unity
+  projects. When switching from code/text work to Unity asset operations, stop using
+  OpenCode and move to Unity Skills / Unity Editor / user-confirmed workflows. Start a
+  fresh session after `no_event_noop_risk`, `session_reuse_risk`, `policy_violation`,
+  `failed`, `cancelled`, `timed_out`, obvious misunderstanding, or incomplete changes.
 - Keep prompts small and iterative. Prefer one clear delivery target per OpenCode job,
   review the result, then dispatch the next step. Avoid combining multi-file
   migration, validation, documentation, and reporting into one large prompt.
+- Before dispatching a real OpenCode job, show the prompt that will be sent to
+  `opencode_coder` so the user can understand the goal, scope, allowed/forbidden
+  paths, acceptance criteria, and validation requirements. If the prompt is very
+  long, show at least a structured summary and the critical constraints.
 - Prefer `wait_policy="start_only"` or `"first_output"` for long tasks, then use
-  `opencode_coder_wait` to block for meaningful changes or poll with compact
-  `opencode_coder_status(job_id, wait_seconds=...)`.
+  `opencode_coder_wait` to block for meaningful changes. Fall back to compact
+  `opencode_coder_status(job_id, wait_seconds=...)` only when wait is unavailable or
+  cursor/delta diagnostics are needed.
 - Use `caller_update_recommended`, `caller_update_reason`, and
   `next_poll_after_seconds` to avoid noisy user updates. Dispatch a lightweight
-  wait first: `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting",
+  wait first: `opencode_coder_wait(job_id, wait_seconds=120, return_on="interesting",
   include_status=false)` only returns `job_id`, `status`, and wait outcome fields.
   When the wait signals an interesting update (e.g. terminal status, first change,
   stall, policy violation), call `opencode_coder_status(job_id)` to get the full
   diagnostic snapshot. Continue with `opencode_coder_wait` for ordinary running
-  jobs; do not turn short `next_poll_after_seconds=5/10` hints into frequent user
+  jobs. Normal status checks or user-facing updates should use a 120-second-or-longer
+  cadence; do not turn short `next_poll_after_seconds=5/10` hints into frequent user
   updates. Treat `next_poll_after_seconds` as a status-fallback diagnostic hint, not
   as the normal wait cadence. Normal running jobs can stay silent while still
   reporting terminal statuses, first changes, stalls, policy violations, validation
@@ -153,6 +172,9 @@ surface, not as a raw terminal stream.
 - The wrapper does not run project validation and does not auto-rollback partial edits.
   Review `opencode_coder_diff(job_id)` and fall back to local `git status` / `git diff`
   when the diff result is incomplete or surprising.
+- Do not cancel the first run casually. Even if first change takes a while, prefer
+  observing with `opencode_coder_wait` until terminal status, clear stall / policy
+  risk, an external wait, or an explicit user decision appears.
 
 ## Tools
 
@@ -580,8 +602,31 @@ Review-risk fields make non-atomic outcomes explicit:
   `new_changed_files`. This is an early running-state warning and does not replace
   `incomplete_changes_risk` for failed, cancelled, or timed-out jobs.
 - `preexisting_dirty_warning`: non-empty when the worktree already had dirty files
-  before the job. In that case, `all_changed_files` cannot be attributed solely to
-  this job.
+  before the job. In that case, `all_changed_files` and diffs may include changes
+  that predate this job and cannot be attributed solely to this job. This warning is
+  common during consecutive OpenCode work, especially when a later job continues from
+  an earlier uncommitted change. The warning is not automatically a defect, but it
+  increases attribution and diff-review cost.
+
+To reduce `preexisting_dirty_warning` and keep job attribution clear, callers following
+this contract should have the main conversation / Feature Owner review and validate
+each completed OpenCode job, then commit that job's scoped changes by default unless
+the user explicitly asks not to commit. OpenCode itself should not commit by default
+unless the user explicitly authorizes it to handle commits. Before committing, stage
+only files that belong to this OpenCode call; do not include user preexisting dirty
+changes or unrelated files. If a file contains both user edits and OpenCode edits, use
+hunk-level review/staging or ask the user to confirm.
+
+Recommended rhythms:
+
+- Commit each reviewed OpenCode job: the default recommended cadence, with the clearest
+  attribution and fewer warnings, but more commits.
+- Commit at the end of each phase: fewer commits, but consecutive fixes inside the
+  phase may still report `preexisting_dirty_warning`.
+
+Whether or not changes are committed, any `preexisting_dirty_warning` requires
+`opencode_coder_diff` or local `git status` / `git diff` review. Do not accept a job
+solely because it is `completed` / `success=true`.
 
 The no-event no-op risk is separate from stalled detection: the process has already
 completed, so the wrapper will not cancel, kill, or automatically rerun it. It is
@@ -606,10 +651,16 @@ Session reuse diagnostics are memory-only and conservative:
   overlap with paths changed by visible previous jobs in the same session. It is not
   proof.
 
-Recommended controlled session reuse: same `working_dir`, same feature/topic, no
-previous `no_event_noop_risk`, no previous abnormal terminal status, explicit
-permission to preserve conversational context, and never across Unity projects or
-repository roots.
+Recommended controlled session reuse: same `working_dir`, same feature/topic, previous
+job `completed/success`, no `no_event_noop_risk`, no `session_reuse_risk`, no abnormal
+terminal status, and no obvious misunderstanding or incomplete changes. Consecutive
+small review fixes in the same phase are usually good candidates. Across phase
+boundaries, re-evaluate the task boundary: reuse is acceptable when the topic,
+context, and risk boundary remain continuous, but the prompt must restate the target,
+allowed paths, and forbidden paths. Start a fresh session when the task type, allowed
+paths, or risk boundary changes materially. Never reuse across Unity projects,
+repository roots, or `working_dir` values. Even when `session_reuse_risk=false`,
+session reuse is not fully safe; still review diffs and risk fields.
 
 An active job with no stdout/stderr and no file changes can still be marked stalled,
 but it does not set `potential_incomplete_changes_risk` because no job-scoped file

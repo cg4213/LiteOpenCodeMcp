@@ -110,32 +110,38 @@ python -B -m unittest -v test_opencode_coder.py
 
 推荐把 LiteOpenCodeMcp 当作“任务调度器 + 紧凑 review 面板”，不要当作会持续吐完整终端输出的同步命令。
 
-- 默认复用 `server_id`。同一 `working_dir`、同一 feature/topic、上一 job 没有 `no_event_noop_risk`、上一 job 没有异常 terminal status 时，默认优先复用 `session_id`，以减少重复读取上下文；不同任务主题、不同仓库/Unity 项目、上一 job 异常或出现 no-op 风险时，不要复用 session。
+- 默认复用 `server_id`。session 复用的目标是减少重复上下文读取和 token 消耗，但不是绝对安全机制。同一 `working_dir`、同一 feature/topic、上一 job `completed/success`、无 `no_event_noop_risk`、无异常 terminal status、无明显误解或不完整改动时，优先复用上一轮健康的 `session_id`。
+- 同一 phase 内的连续修正、小步 review fix 通常适合复用 session。跨 phase 时不要机械禁止或机械复用，应重新评估：如果仍属于同一工具代码主题、上下文连续、风险边界没有显著变化，可以复用 session，但 prompt 必须重新声明目标、允许路径和禁止范围；如果任务类型、允许路径或风险边界明显变化，应新开 session。
+- 不应跨 `working_dir`、跨仓库根、跨 Unity 项目复用 session。从纯代码/文本任务切换到 Unity 资产操作时，不应继续使用 OpenCode，应改用 Unity Skills / Unity Editor / 用户手动流程。上一 job 出现 `no_event_noop_risk`、`session_reuse_risk`、`policy_violation`、`failed`、`cancelled`、`timed_out`、明显误解或不完整改动时，应新开 session。
 - 大工作提示词必须小步快跑：每个 OpenCode job 只交付一个明确目标，尽量避免把“多文件迁移 + 验证 + 文档 + 报告”塞进同一轮；完成后 review，再派发下一步。
+- 每次实际派发 OpenCode 前，应先在主对话输出将要交给 `opencode_coder` 的提示词，让用户能理解本轮目标、范围、允许/禁止路径、验收和测试要求。提示词过长时也应至少输出结构化摘要和关键约束。
 - 长任务优先使用 `wait_policy="start_only"` 或 `"first_output"`，让主对话尽快拿回控制权，
-  再用 `opencode_coder_wait` 等待关键变化或 compact status 轮询。
+  再优先用 `opencode_coder_wait` 等待关键变化；只有 wait 不可用或需要 cursor/delta 诊断时，才回退 compact status 轮询。
 - 轮询时优先使用 `caller_update_recommended`、`caller_update_reason`、`next_poll_after_seconds`
   控制汇报频率：派发后先用轻量等待获取第一个信号：
-  `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)`
+  `opencode_coder_wait(job_id, wait_seconds=120, return_on="interesting", include_status=false)`
   只返回 `job_id`、`status` 和 wait 结果；当 wait 发现 interesting 更新（如 terminal、首次变更、
   stalled、policy violation）后，再按需调用 `opencode_coder_status` 获取完整诊断快照。
-  后续优先继续用 wait，而不是按 `next_poll_after_seconds=5/10` 这类短建议快速追问；`next_poll_after_seconds` 只作为 status fallback 的诊断参考。普通 running 且只有近期普通活动时可静默继续；
+  后续优先继续用 wait；普通状态查询或向用户汇报的节奏默认不低于 120 秒，不要按 `next_poll_after_seconds=5/10` 这类短建议快速追问；`next_poll_after_seconds` 只作为 status fallback 的诊断参考。普通 running 且只有近期普通活动时可静默继续；
   terminal、首次变更、stalled、policy violation、验证观察、no-event no-op 风险等才值得汇报。
 - 普通轮询不要传 `include_tail`、`include_output`、`include_delta`。这些是调试开关，只有需要看原始 stdout/stderr 或 event 流时才打开，并配合字符上限。
 - 不要只因 `status=completed` 或 `success=true` 就接受结果。完成后必须看 `suggested_action`、`work_summary_text`、变更文件、path policy、stall/risk、`no_event_noop_risk` 和 validation 字段。
 - 如果 `no_event_noop_risk=true`，应不传 `session_id` 重试，或新开 session/server；不要把它当作正常完成。
 - wrapper 不主动运行项目验证，也不会自动回滚半成品。需要结合 `opencode_coder_diff(job_id)`，必要时回退到本地 `git status` / `git diff` 复核。
+- 初次执行不要轻易 cancel。首轮 job 即使 first change 前等待较久，也应优先用 `opencode_coder_wait` 观察到终止状态、明确 stall / policy 风险、外部等待或用户要求后，再考虑取消；不要只因为“看起来在思考”就中止。
 
 长任务推荐流程：
 
 1. 用 `opencode_server_start` 启动一个 managed OpenCode server。
 2. 同一工作话题连续 job 默认带上上一轮健康完成的 `session_id`；换话题、换项目或上一轮有 no-op/失败/取消/超时风险时新开 session。
-3. 用 `opencode_coder(..., server_id=..., session_id=..., wait_policy="start_only")` 派发任务，尽快拿到 `job_id`。
-4. 用 `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)` 轻量等待关键变化。
-5. wait 返回 `interesting_update=true` 后，再用 `opencode_coder_status(job_id)` 获取完整诊断；如果 wait 不可用或需要 cursor/delta 调试，再回退到 compact status 轮询。
-6. 用 `opencode_coder_diff(job_id)` 审查本 job 涉及的变更。
-7. 需要中止时调用 `opencode_coder_cancel(job_id)`。
-8. 新对话或 MCP 重启后，用 `opencode_server_list` 找回可复用的 managed server。
+3. 派发前在主对话输出本轮 OpenCode 提示词或结构化摘要，明确目标、范围、路径策略、验收和验证。
+4. 用 `opencode_coder(..., server_id=..., session_id=..., wait_policy="start_only")` 派发任务，尽快拿到 `job_id`。
+5. 用 `opencode_coder_wait(job_id, wait_seconds=120, return_on="interesting", include_status=false)` 轻量等待关键变化；普通轮询/汇报间隔不低于 120 秒。
+6. wait 返回 `interesting_update=true` 后，再用 `opencode_coder_status(job_id)` 获取完整诊断；如果 wait 不可用或需要 cursor/delta 调试，再回退到 compact status 轮询。
+7. 用 `opencode_coder_diff(job_id)` 审查本 job 涉及的变更。
+8. 每次 OpenCode job 完成后，如果主对话/FO review 通过、验证通过且无用户禁止，应做一次 job 级 commit；只 stage 和 commit 本次调用相关改动。
+9. 需要中止时调用 `opencode_coder_cancel(job_id)`，但初次执行不要轻易取消。
+10. 新对话或 MCP 重启后，用 `opencode_server_list` 找回可复用的 managed server。
 
 如果不传 `server_id`，`opencode_coder` 仍保持直接执行 `opencode run` 的兼容行为。
 
@@ -445,7 +451,16 @@ wrapper 不会因为这些字段自动 cancel、kill、回滚或清理文件。�
 - `review_required`：active、failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`；completed 但有 path policy violation 或 `no_event_noop_risk=true` 时也为 `true`。
 - `incomplete_changes_risk`：failed、cancelled、timed_out 且存在 `new_changed_files` 时为 `true`。
 - `potential_incomplete_changes_risk`：active 且 stalled 的 job 已经存在 `new_changed_files` 时为 `true`。这是运行中疑似半成品的提前提醒，不替代 failed、cancelled、timed_out 场景下的 `incomplete_changes_risk`。
-- `preexisting_dirty_warning`：任务开始前工作区已有 dirty 文件时非空，提醒 `all_changed_files` 不能简单归因给本 job。
+- `preexisting_dirty_warning`：任务开始前工作区已有 dirty 文件时非空，提醒 `all_changed_files` / diff 可能混入本 job 前已有改动，不能简单归因给本 job。连续使用 OpenCode 时该 warning 很常见，尤其是同一任务分多轮执行、后一轮基于前一轮未提交改动继续修正时；它本身不一定代表风险，但会增加 job 归因和 diff review 成本。
+
+为了降低 `preexisting_dirty_warning` 并提升每个 job 的归因清晰度，采用本规范的调用方建议在每轮 OpenCode job 完成后，由主对话 / Feature Owner 完成 review 和验证；通过后默认做一次 job 级 commit，除非用户明确要求暂不提交。commit 不应由 OpenCode 默认执行，除非用户明确授权它处理提交。commit 前必须只 stage 本次调用相关文件，不得把用户已有脏改动或无关文件带入 commit；如果同一文件内混有用户手改和 OpenCode 改动，应使用 hunk 级别 review/stage，或先让用户确认。
+
+推荐两种节奏：
+
+- 每个通过 review 的 OpenCode job commit 一次：这是默认推荐节奏，job 归因最清晰，warning 最少，但 commit 数量较多。
+- 每个 phase 完成后 commit 一次：commit 更少，但 phase 内连续修正仍可能出现 `preexisting_dirty_warning`。
+
+无论是否 commit，只要出现 `preexisting_dirty_warning`，都必须用 `opencode_coder_diff` 或本地 `git status` / `git diff` 复核，不得只看 `completed` / `success`。
 
 `no_event_noop_risk` 和 stalled 是两类问题：此时进程已经 completed，wrapper 不会 cancel、kill，也不会自动重跑。direct run 且没有 session 复用参数、completed 但有真实 stdout JSON event / 文本输出、或有 `new_changed_files` 的 job 不应被标记为 no-op 风险。一旦出现该字段，应优先不传 `session_id` 重试，或新开 session/server，而不是只因 `status=completed` 就接受结果。
 
@@ -456,7 +471,7 @@ session 复用诊断只基于当前 MCP 进程内存中仍可见的 job，重启
 - `session_reuse_risk`、`session_reuse_note`：仅在有明显风险时置风险，例如 `no_event_noop_risk`、同 session 可见历史存在 working_dir 不一致、上一同 session job 异常结束等。`session_reuse_risk=false` 不等于绝对安全。
 - `likely_preexisting_from_same_session`、`likely_preexisting_same_session_files`：当前 job 的 preexisting dirty 路径与内存中可见的上一同 session job 改动路径有交集时给出提示；这是提示，不是证明。
 
-受控 session 复用建议：同一 `working_dir`、同一 feature/topic、上一 job 无 `no_event_noop_risk`、上一 job 无异常 terminal status、用户/FO 明确允许连续上下文，并且不跨 Unity 项目、不跨仓库根。
+受控 session 复用建议：同一 `working_dir`、同一 feature/topic、上一 job `completed/success`、无 `no_event_noop_risk`、无 `session_reuse_risk`、无异常 terminal status、无明显误解或不完整改动时，可以优先复用 session。同一 phase 内的连续修正、小步 review fix 通常适合复用；跨 phase 时应重新评估任务边界，如果仍属于同一工具代码主题、上下文连续、风险边界没有显著变化，可以复用，但 prompt 必须重新声明目标、允许路径和禁止范围；如果任务类型、允许路径或风险边界明显变化，应新开 session。不要跨 Unity 项目、跨仓库根、跨 `working_dir` 复用 session。即使 `session_reuse_risk=false`，也不能把 session 复用视为完全安全，仍必须 review diff 和风险字段。
 
 active job 如果长时间没有 stdout/stderr 且没有文件变更，也可以被标记为 stalled；但由于没有观察到本 job 的文件改动，不会设置 `potential_incomplete_changes_risk`。
 

@@ -27,6 +27,7 @@
 - 大工作提示词不要一次性塞给 OpenCode。涉及多个文件、多条设计分支、迁移 + 验证 + 报告的任务，应先由 Feature Owner 拆成边界清晰的多步任务，逐步派发、逐步 review。
 - 每个 OpenCode job 尽量只对应一个明确交付目标；后一轮可以基于前一轮结果继续修正或补验证。
 - 如果首轮长时间停在 first_change 之前，应优先考虑缩小下一轮 prompt，而不是继续扩大同一个任务。
+- 只要本轮会实际调用 OpenCode，派发前必须先把准备交给 `opencode_coder` 的提示词输出给用户，让用户理解本轮发生什么。提示词过长时也要至少输出目标、范围、allowed_paths、forbidden_paths、验收标准、测试要求和 report 要求。
 
 Unity 资产硬边界：
 OpenCode 不用于 Unity 资产写入，包括但不限于 prefab、scene、.asset、ScriptableObject 实例资产、材质、动画、Timeline、UI prefab 层级、import settings、资源引用绑定等。
@@ -40,19 +41,22 @@ OpenCode 不应主动手写、伪造或批量修改 Unity .meta 文件；.cs.met
    - 先 opencode_server_list 查看是否已有可复用 server。
    - 没有合适 server 时，用 opencode_server_start 启动。
    - 默认复用 server_id。
-   - 同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out 时，默认优先复用上一轮健康的 session_id，以减少重复读上下文。
-   - 换任务主题、换 working_dir/仓库根、上一 job 异常或出现 no-op 风险时，必须新开 session；不要跨 Unity 项目复用 session。
+   - session 复用的目标是减少重复上下文读取和 token 消耗，但不是绝对安全机制。
+   - 同一 working_dir、同一 feature/topic、上一 job completed/success、无 no_event_noop_risk、无 failed/cancelled/timed_out、无明显误解或不完整改动时，默认优先复用上一轮健康的 session_id。
+   - 同一 phase 内连续修正、小步 review fix 通常适合复用 session。跨 phase 时不要机械禁止或机械复用：如果仍属于同一工具代码主题、上下文连续、风险边界没有显著变化，可以复用 session，但 prompt 必须重新声明目标、allowed_paths 和 forbidden_paths；如果任务类型、允许路径或风险边界明显变化，应新开 session。
+   - 换任务主题、换 working_dir/仓库根、上一 job 异常或出现 no-op 风险时，必须新开 session；不要跨 Unity 项目复用 session。从纯代码/文本任务切换到 Unity 资产操作时，不应继续使用 OpenCode。
    - 复用 server 前必须确认 working_dir 是本次目标项目/仓库路径；不要跨 Unity 项目复用 session。
 3. 派发任务时使用 opencode_coder，并优先设置 wait_policy 为 start_only 或 first_output。
 4. 使用 opencode_coder_wait / opencode_coder_status 观察任务，直到 completed / failed / cancelled；running / timed_out 不能当作完成。
-   降低询问/汇报频率：派发后第一次状态查询建议等 60-90 秒，之后优先用 opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)
+   降低询问/汇报频率：派发后第一次观察优先用 opencode_coder_wait(job_id, wait_seconds=120, return_on="interesting", include_status=false)
    等待关键变化，只有 wait 返回 interesting 更新时再调用 opencode_coder_status 获取完整诊断细节。
-   如果 opencode_coder_wait 不可用或已有 unread stdout/stderr cursor，可回退到 45-90 秒节奏用
+   如果 opencode_coder_wait 不可用或已有 unread stdout/stderr cursor，可回退到不低于 120 秒节奏用
    opencode_coder_status 轮询；不要因为 next_poll_after_seconds=5/10 这类短建议就频繁追问或频繁向用户汇报；
    只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
 5. 普通轮询不要传 include_tail、include_output、include_delta；只有调试原始输出时才显式打开，并限制 tail_max_chars / delta_max_chars。
 6. 如果有文件变更，必须用 opencode_coder_diff 或本地 git diff review。
 7. 大工作提示词必须小步快跑：每轮只交付一个明确目标，避免把多文件迁移、验证、文档和报告塞进同一轮；每轮完成后先 review，再派发下一步。
+8. 初次执行不要轻易 cancel。首轮 job 即使 first change 前等待较久，也应优先用 opencode_coder_wait 观察到终止状态、明确 stall / policy 风险、外部等待或用户要求后，再考虑取消；不要只因为“看起来在思考”就中止。
 
 路径与权限：
 每次派发 OpenCode 任务都要明确：
@@ -87,12 +91,17 @@ allowed_paths / forbidden_paths 是变更审查和风险标记，不是强沙箱
 - 如果 policy_violation=true，必须优先说明越界文件和风险。
 - 如果 no_event_noop_risk=true，不要把 completed / success=true 当成可信完成；优先不复用 session 重试，或新开 session/server。
 - 如果 session_reuse_risk=true，必须说明复用风险；即使 session_reuse_risk=false，也不要把 session 复用视为绝对安全。
+- 如果上一 job 出现 no_event_noop_risk、session_reuse_risk、policy_violation、failed、cancelled、timed_out、明显误解或不完整改动，应新开 session。
 - 如果 caller_update_recommended=false，普通轮询可静默继续；如果为 true，应结合 caller_update_reason 判断是否向用户汇报。
 - 如果 status 里出现 next_poll_after_seconds=5/10，只把它当作 status fallback 的内部诊断提示；正常调用优先继续使用 opencode_coder_wait，不要把它转成对用户的快速轮询汇报。
 - 如果 opencode_coder_status(job_id) 返回 not_found，不要假设任务成功或失败；应检查 MCP server 是否重启、job registry 是否丢失，并用本地 git status / git diff 判断是否留下改动。
 - 如果 failed / cancelled / timed_out 后存在文件变更，也必须 review diff / git status。
 - 如果 opencode_coder_diff 返回 diff 不完整、undiffed_files、diff_command_errors 或 success=false，必须回退本地 git status / git diff 复核。
 - 如果 includes_preexisting_dirty_changes=true 或 preexisting_dirty_warning 非空，必须说明 diff 可能混入任务前已有脏改动。
+- preexisting_dirty_warning 在连续使用 OpenCode 时很常见，尤其是后一轮基于前一轮未提交改动继续修正时；它本身不一定代表风险，但会增加 job 归因和 diff review 成本。
+- 如果希望降低 preexisting_dirty_warning，应在每轮 OpenCode job 完成后，由主对话/FO review 和验证；通过后默认做一次 job 级 commit，除非用户明确要求暂不提交。commit 不应由 OpenCode 默认执行，除非用户明确授权它处理提交。
+- commit 前必须只 stage 本次 OpenCode 调用相关文件，不能把用户已有脏改动或无关文件带入 commit；如果同一文件内混有用户手改和 OpenCode 改动，应使用 hunk 级别 review/stage，或先让用户确认。
+- 默认节奏是“每个通过 review 的 job commit 一次”；也可在用户要求下改为“每个 phase 完成后 commit 一次”。无论是否 commit，出现 preexisting_dirty_warning 都必须用 opencode_coder_diff 或本地 git diff/status 复核。
 
 Unity 验证：
 如果 OpenCode 完成的是 Unity 逻辑代码开发，提示词中应要求开发对话完成后优先使用 Unity Skills 触发编译验证：
@@ -104,6 +113,7 @@ observed_validation_* 只是 wrapper 从 OpenCode 执行型工具信号中观察
 
 最终回复要求：
 最终回复必须用中文，简洁说明：
+- 本轮派发给 OpenCode 的提示词要点，或说明派发前已向用户输出过提示词
 - OpenCode job_id、status、success、exit_code
 - OpenCode 自己反馈完成了什么
 - 修改了哪些文件
@@ -112,5 +122,6 @@ observed_validation_* 只是 wrapper 从 OpenCode 执行型工具信号中观察
 - 是否存在 no-op、stall、半成品、preexisting dirty 风险
 - 是否 review 了 diff
 - 是否跑了测试 / 编译验证；如果没跑，明确说明
+- 如果 review 和验证通过且已按本规范 commit，说明 commit 哈希；如果未 commit，说明原因
 - 如果发现问题，优先给出阻断问题和下一轮 OpenCode 修正提示词，而不是自己直接改代码
 ```
