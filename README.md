@@ -129,14 +129,19 @@ surface, not as a raw terminal stream.
 - Split large prompts into multiple bounded jobs. Prefer one clear delivery target per
   OpenCode job, review the result, then dispatch the next step. This keeps long
   reading/planning phases visible and easier to correct.
-- Prefer `wait_policy="start_only"` or `"first_output"` for long tasks, then poll with
-  compact `opencode_coder_status(job_id, wait_seconds=...)`.
+- Prefer `wait_policy="start_only"` or `"first_output"` for long tasks, then use
+  `opencode_coder_wait` to block for meaningful changes or poll with compact
+  `opencode_coder_status(job_id, wait_seconds=...)`.
 - Use `caller_update_recommended`, `caller_update_reason`, and
-  `next_poll_after_seconds` to avoid noisy user updates. The first status poll should
-  usually wait 60-90 seconds after dispatch; follow-up polls can use
-  `next_poll_after_seconds` or a 45-90 second cadence. Normal running jobs can stay
-  silent while still reporting terminal statuses, first changes, stalls, policy
-  violations, validation sightings, and no-event no-op risk.
+  `next_poll_after_seconds` to avoid noisy user updates. Dispatch a lightweight
+  wait first: `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting",
+  include_status=false)` only returns `job_id`, `status`, and wait outcome fields.
+  When the wait signals an interesting update (e.g. terminal status, first change,
+  stall, policy violation), call `opencode_coder_status(job_id)` to get the full
+  diagnostic snapshot. Follow-up polls can use `next_poll_after_seconds` or a
+  45-90 second cadence. Normal running jobs can stay silent while still reporting
+  terminal statuses, first changes, stalls, policy violations, validation sightings,
+  and no-event no-op risk.
 - Do not request raw output in the normal polling loop. `include_tail`,
   `include_output`, and `include_delta` are debug switches and should be paired with
   explicit character caps when enabled.
@@ -205,7 +210,9 @@ Wait policies:
   completes, or `timeout_seconds` elapses.
 
 For long-running coding tasks, prefer `"start_only"` or `"first_output"` so the
-caller can regain control quickly and poll with `opencode_coder_status`.
+caller can regain control quickly, then use lightweight `opencode_coder_wait(...,
+include_status=false)` for long polling. Call `opencode_coder_status` only when the
+wait reports an interesting update or when full diagnostics are needed.
 
 By default, `opencode_coder` returns compact work feedback: `status`, `success`,
 `suggested_action`, `summary`, `work_summary_text` / `last_text_output`,
@@ -639,6 +646,73 @@ conservatively, `passed` only for clear passing markers such as Unity console
 window contains both passing-looking and failing-looking signals, the wrapper prefers
 `failed` or `inconclusive` over reporting `passed`.
 
+### `opencode_coder_wait`
+
+A long-polling tool that waits inside a single MCP call until the job reaches a
+meaningful change or the wait window expires. This reduces token waste from frequent
+`opencode_coder_status` polling at short intervals.
+
+Parameters:
+
+- `job_id`: job returned by `opencode_coder`.
+- `wait_seconds`: maximum wait time, clamped to `0..600` seconds. Defaults to `90`.
+  The upper bound is conservative to avoid extreme MCP tool call timeouts while still
+  allowing bulk polling. Longer waits should be split into multiple
+  `opencode_coder_wait` calls or mixed with `opencode_coder_status` queries.
+- `return_on`: what kind of event triggers a return. Options:
+  - `"interesting"` (default): return when `caller_update_recommended=true`, the job
+    reaches a terminal status, the first file change appears, a policy violation is
+    detected, the job stalls, no-event no-op risk is detected, or observed validation
+    is passed/failed. If no interesting event occurs, returns with
+    `wait_return_reason="wait_timeout"`.
+  - `"terminal"`: return only when the job reaches `completed`, `failed`, or
+    `cancelled`. Runs and first file changes are not treated as return triggers. If
+    the job does not reach a terminal state, returns with `wait_timeout`.
+- `include_status`: defaults to `true`. When true, returns the full job status result
+  (same shape as `opencode_coder_status`) plus wait-specific fields. When false,
+  returns only `job_id`, `status`, and wait-specific fields. Lightweight polling
+  should use `include_status=false` to save tokens; call `opencode_coder_status` only
+  when the wait returns an interesting update.
+- `include_tail`, `include_output`, `include_delta`: debug flags, same as
+  `opencode_coder_status`. All default to `false` for compact output.
+
+Returned wait-specific fields (present in addition to status fields when
+`include_status=true`, or standalone when `include_status=false`):
+
+- `wait_return_reason`: why the wait returned. Possible values:
+  - `terminal_status` — job reached completed/failed/cancelled.
+  - `first_change_seen` — new file changes appeared during this wait window (not
+    changes already observed by a previous `opencode_coder` or `opencode_coder_wait`
+    call).
+  - `caller_update_recommended` (or the underlying reason such as `stalled`,
+    `policy_violation`, `no_event_noop_risk`, `no_first_change_after_budget`,
+    `validation_observed`) — an interesting condition from the progress diagnostics.
+  - `wait_timeout` — wait window expired without an interesting change.
+  - `not_found` — `job_id` was not found.
+- `interesting_update`: `true` if a meaningful change was detected; `false` when the
+  wait timed out with no new signal.
+- `waited_seconds`: actual time spent waiting, in seconds.
+
+When the wait times out (`wait_return_reason="wait_timeout"`, `interesting_update=false`),
+the returned result is a compact heartbeat: the job may still be running,
+`caller_update_recommended` is likely `false`, and raw tail/delta/output is empty
+by default.
+
+If `job_id` is not found, `wait` returns immediately with `wait_return_reason="not_found"`
+and `waited_seconds=0.0`. It does not block.
+
+Differences from `opencode_coder_status`:
+
+- `opencode_coder_status` is a point-in-time snapshot with an optional short
+  `wait_seconds` (max 30s) for simple output/change detection.
+- `opencode_coder_wait` is a dedicated long-polling call (max 600s) that filters for
+  higher-level "interesting" events. It replaces multiple compact status polls with
+  one MCP tool call.
+- `opencode_coder_wait` does not support stdout/stderr cursor parameters; use
+  `opencode_coder_status` for cursor-based delta polling.
+- `opencode_coder_wait` is not an MCP push notification — it blocks the calling
+  conversation until it returns.
+
 ### `opencode_coder_diff`
 
 Returns a bounded git diff for a known `opencode_coder` job:
@@ -984,18 +1058,21 @@ The wrapper still returns legacy fields:
 New callers should prefer `status`, `exit_code`, `stdout_cursor` /
 `stderr_cursor`, `suggested_action`, `work_summary_text`, `new_changed_files`, risk
 fields, and `opencode_coder_diff`.
-For polling loops, prefer compact `opencode_coder_status` responses with cursor
-metadata. `stdout_delta` / `stderr_delta` and `recent_events` are debug diagnostics,
-not the normal calling contract. Tail fields are bounded by line and character
-limits, but neither tool includes them unless `include_tail=true`. Legacy `output`
-is also empty unless `include_output=true`.
+For normal observation loops, prefer lightweight `opencode_coder_wait(...,
+include_status=false)` and fetch compact `opencode_coder_status` only after an
+interesting update or when full diagnostics are needed. `stdout_delta` /
+`stderr_delta` and `recent_events` are debug diagnostics, not the normal calling
+contract. Tail fields are bounded by line and character limits, but neither tool
+includes them unless `include_tail=true`. Legacy `output` is also empty unless
+`include_output=true`.
 
 ## Integration Smoke Test
 
 The real OpenCode integration smoke test is opt-in and skipped by default. It starts
 a managed `opencode serve` process, runs `opencode_coder` through `--attach`, polls
 `opencode_coder_status`, and verifies git snapshot fields in a temporary git
-repository.
+repository. `opencode_coder_wait` is currently covered by unit/fake-process tests;
+add a real wait smoke before treating it as integration-covered.
 
 The smoke test may perform a real model call and can depend on network access,
 authentication, configured OpenCode provider state, and any associated usage costs.
@@ -1025,3 +1102,6 @@ diagnosis.
   trees.
 - More detailed test/validation extraction from OpenCode output.
 - Automatic rollback or cleanup for policy violations.
+- `opencode_coder_wait` currently uses periodic `refresh_job_snapshot` + diagnostic
+  rebuild to detect interesting signals. Future iterations could use dedicated
+  threading Events for faster stall/validation/noop detection during wait.

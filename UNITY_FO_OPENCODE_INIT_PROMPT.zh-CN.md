@@ -44,7 +44,11 @@ OpenCode 不应主动手写、伪造或批量修改 Unity .meta 文件；.cs.met
    - 同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out，且用户或 FO 明确允许连续上下文时，可以受控复用 session_id 以减少重复读上下文。
    - 复用 server 前必须确认 working_dir 是本次目标项目/仓库路径；不要跨 Unity 项目复用 session。
 3. 派发任务时使用 opencode_coder，并优先设置 wait_policy 为 start_only 或 first_output。
-4. 使用 opencode_coder_status 轮询，直到 completed / failed / cancelled；running / timed_out 不能当作完成。降低询问/汇报频率：派发后第一次状态查询建议等 60-90 秒，之后优先按 next_poll_after_seconds 或 45-90 秒节奏轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
+4. 使用 opencode_coder_wait / opencode_coder_status 观察任务，直到 completed / failed / cancelled；running / timed_out 不能当作完成。
+   降低询问/汇报频率：派发后第一次状态查询建议等 60-90 秒，之后优先用 opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)
+   等待关键变化，只有 wait 返回 interesting 更新时再调用 opencode_coder_status 获取完整诊断细节。
+   如果 opencode_coder_wait 不可用或已有 unread stdout/stderr cursor，可回退到按 next_poll_after_seconds 或 45-90 秒节奏用
+   opencode_coder_status 轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
 5. 普通轮询不要传 include_tail、include_output、include_delta；只有调试原始输出时才显式打开，并限制 tail_max_chars / delta_max_chars。
 6. 如果有文件变更，必须用 opencode_coder_diff 或本地 git diff review。
 
@@ -59,9 +63,10 @@ OpenCode 不应主动手写、伪造或批量修改 Unity .meta 文件；.cs.met
 
 allowed_paths / forbidden_paths 是变更审查和风险标记，不是强沙箱或权限隔离。即使没有 policy_violation，也必须 review diff；如果变更结果和任务范围不一致，必须回退本地 git status / git diff 复核。
 
-每次 opencode_coder / opencode_coder_status 后必须检查：
+每次 opencode_coder / opencode_coder_wait / opencode_coder_status 后必须检查。使用 include_status=false 的 wait 时，先检查 wait 结果；若 interesting_update=true，再调用 status 获取完整诊断：
 - status、success、error、job_id、working_dir、exit_code、suggested_action
 - progress_phase、progress_message、caller_update_recommended、caller_update_reason、next_poll_after_seconds
+- wait_return_reason、interesting_update、waited_seconds（使用 opencode_coder_wait 时）
 - summary、work_summary_text、assistant_last_text、last_text_output
 - new_changed_files、all_changed_files、preexisting_changed_files
 - policy_violation、extra_changed_files、forbidden_changed_files

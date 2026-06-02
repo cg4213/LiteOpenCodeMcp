@@ -18,15 +18,21 @@
    - 先用 opencode_server_list 查看是否已有可复用 server。
    - 没有合适 server 时，用 opencode_server_start 启动。
    - 派发任务时用 opencode_coder(..., server_id=..., wait_policy="start_only" 或 "first_output")。
-   - 用 opencode_coder_status(job_id, wait_seconds=...) 轮询结果；默认 compact status 不返回长 tail、legacy output 或 stdout/stderr delta 正文。
+   - 派发后优先用 opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false) 等待关键变化；wait 返回 interesting 更新后，再用 opencode_coder_status(job_id) 获取完整诊断。
+   - 如果 opencode_coder_wait 不可用，或需要 cursor/delta 诊断，再回退到 opencode_coder_status(job_id, wait_seconds=...)；默认 compact status 不返回长 tail、legacy output 或 stdout/stderr delta 正文。
    - 完成后用 opencode_coder_diff(job_id) 辅助 review。
 3. 默认复用 server_id，不默认复用 session_id。只有明确需要延续 OpenCode 会话上下文时才传 session_id、continue_last 或 fork_session；不要跨不同 working_dir 或不同仓库根目录复用 session_id。同一 working_dir、同一 feature/topic、上一 job 无 no_event_noop_risk、上一 job 无 failed/cancelled/timed_out，且用户或 FO 明确允许连续上下文时，可以受控复用 session_id 以减少重复读上下文。
 4. 小任务也可以直接用 opencode_coder，但仍必须检查返回结果。
 5. 普通轮询不要传 include_tail、include_output、include_delta。只有调试原始输出时才显式打开，并配合 tail_max_chars / delta_max_chars。
-6. 降低询问/汇报频率：派发 job 后第一次状态查询建议等 60-90 秒，后续优先按 next_poll_after_seconds 或 45-90 秒节奏轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现或需要用户决策时才向用户汇报。
+6. 降低询问/汇报频率：派发 job 后第一次状态查询建议等 60-90 秒，后续优先用
+   opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false) 等待关键变化；
+   只有 wait 返回 interesting 更新时才调用 opencode_coder_status 获取完整诊断，替代频繁 status 查询。
+   如果 opencode_coder_wait 不可用，可回退到按 next_poll_after_seconds 或 45-90 秒节奏用
+   opencode_coder_status 轮询；只有 caller_update_recommended=true、状态终止、首次变更、风险出现
+   或需要用户决策时才向用户汇报。
 
 强制检查要求：
-每次调用 opencode_coder / opencode_coder_status 后，必须检查返回内容，不能只看工具调用是否成功，也不能只看 status=completed 或 success=true。至少检查：
+每次调用 opencode_coder / opencode_coder_wait / opencode_coder_status 后，必须检查返回内容，不能只看工具调用是否成功，也不能只看 status=completed 或 success=true。使用 include_status=false 的 wait 时，先检查 wait 结果；若 interesting_update=true，再调用 status 获取完整诊断。至少检查：
 - status
 - success
 - error
@@ -36,6 +42,7 @@
 - suggested_action
 - progress_phase / progress_message
 - caller_update_recommended / caller_update_reason / next_poll_after_seconds
+- wait_return_reason / interesting_update / waited_seconds（使用 opencode_coder_wait 时）
 - summary
 - work_summary_text / assistant_last_text / last_text_output
 - new_changed_files
@@ -67,7 +74,7 @@ raw 输出规则：
 
 如果 status 是 timed_out / running：
 - 不要直接判断任务完成。
-- 必须继续用 opencode_coder_status(job_id, wait_seconds=...) 查询，直到 completed / failed / cancelled，或明确向用户说明仍在运行。
+- 必须继续用 opencode_coder_wait(..., include_status=false) 或 opencode_coder_status(job_id, wait_seconds=...) 查询，直到 completed / failed / cancelled，或明确向用户说明仍在运行。
 - 必须检查 is_stalled、stall_reason、suggested_action；is_stalled 不是 failed，但表示应考虑查看 diff/status 后取消或继续轮询。
 - 默认用 caller_update_recommended / caller_update_reason 控制汇报频率；普通 running 且没有重大新信号时可以静默继续轮询。
 

@@ -2811,6 +2811,256 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["forbidden_changed_files"], [])
         self.assertFalse(result["potential_incomplete_changes_risk"])
 
+    def test_wait_not_found_returns_immediately(self):
+        started_at = time.monotonic()
+        result = server.opencode_coder_wait("missing-job", wait_seconds=300)
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["wait_return_reason"], "not_found")
+        self.assertTrue(result["interesting_update"])
+        self.assertEqual(result["waited_seconds"], 0.0)
+
+    def test_wait_running_no_change_times_out_compact(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "no_output_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=0.15,
+                return_on="interesting",
+                include_status=True,
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result["wait_return_reason"], "wait_timeout")
+        self.assertFalse(result["interesting_update"])
+        self.assertGreater(result["waited_seconds"], 0.0)
+        self.assertIn(result["status"], {"running", "timed_out"})
+        self.assertEqual(result["stdout_tail"], "")
+        self.assertEqual(result["stderr_tail"], "")
+        self.assertEqual(result["stdout_delta"], "")
+        self.assertEqual(result["stderr_delta"], "")
+        self.assertEqual(result["output"], "")
+
+    def test_wait_terminal_returns_on_completion(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=5,
+                return_on="terminal",
+            )
+            elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(result["wait_return_reason"], "terminal_status")
+        self.assertTrue(result["interesting_update"])
+        self.assertEqual(result["status"], "completed")
+
+    def test_wait_interesting_returns_on_completion(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=5,
+                return_on="interesting",
+            )
+            elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(result["wait_return_reason"], "terminal_status")
+        self.assertTrue(result["interesting_update"])
+        self.assertEqual(result["status"], "completed")
+
+    def test_wait_first_change_returns_immediately(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "delayed_write:src/changed.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+                allowed_paths=["src"],
+            )
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=5,
+                return_on="interesting",
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertLess(elapsed, 3.0)
+        self.assertEqual(result["wait_return_reason"], "first_change_seen")
+        self.assertTrue(result["interesting_update"])
+        self.assertEqual(result["new_changed_files"], ["src/changed.txt"])
+
+    def test_wait_terminal_without_completion_times_out(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "very_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=0.15,
+                return_on="terminal",
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result["wait_return_reason"], "wait_timeout")
+        self.assertFalse(result["interesting_update"])
+        self.assertGreater(result["waited_seconds"], 0.0)
+
+    def test_wait_include_status_false_returns_minimal(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "no_output_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=0.05,
+                return_on="interesting",
+                include_status=False,
+            )
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertIn(result["status"], {"running", "timed_out"})
+        self.assertIn("wait_return_reason", result)
+        self.assertIn("interesting_update", result)
+        self.assertIn("waited_seconds", result)
+        self.assertNotIn("working_dir", result)
+        self.assertNotIn("stdout_tail", result)
+        self.assertNotIn("new_changed_files", result)
+
+    def test_wait_clamp_helper(self):
+        self.assertEqual(server.clamp_wait_wait_seconds(-1), 0.0)
+        self.assertEqual(server.clamp_wait_wait_seconds(0), 0.0)
+        self.assertEqual(server.clamp_wait_wait_seconds(700), server.MAX_WAIT_WAIT_SECONDS)
+        self.assertEqual(server.clamp_wait_wait_seconds("not-a-number"), server.DEFAULT_WAIT_WAIT_SECONDS)
+        self.assertEqual(server.clamp_wait_wait_seconds(None), server.DEFAULT_WAIT_WAIT_SECONDS)
+
+    def test_wait_does_not_break_existing_status(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            completed = server.opencode_coder("short", working_dir=working_dir, timeout_seconds=2)
+            status = server.opencode_coder_status(completed["job_id"])
+
+        self.assertEqual(status["status"], "completed")
+        self.assertTrue(status["success"])
+        self.assertEqual(status["exit_code"], 0)
+
+    def test_wait_not_found_with_include_status_false_returns_minimal(self):
+        result = server.opencode_coder_wait("missing-job", wait_seconds=5, include_status=False)
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["wait_return_reason"], "not_found")
+        self.assertTrue(result["interesting_update"])
+        self.assertEqual(result["waited_seconds"], 0.0)
+        self.assertNotIn("working_dir", result)
+
+    def test_wait_does_not_return_stale_first_change_seen(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "write_then_sleep:src/file.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                allowed_paths=["src"],
+            )
+            self.assertEqual(initial["caller_update_reason"], "first_change_seen")
+            self.assertIn(initial["status"], {"running", "timed_out"})
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=0.5,
+                return_on="interesting",
+                include_status=False,
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertGreaterEqual(elapsed, 0.35)
+        self.assertEqual(result["wait_return_reason"], "wait_timeout")
+        self.assertFalse(result["interesting_update"])
+
+    def test_wait_returns_for_new_change_during_wait(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "double_write_same_file:src/a.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="first_change",
+                allowed_paths=["src"],
+            )
+            self.assertEqual(initial["caller_update_reason"], "first_change_seen")
+            self.assertIn(initial["status"], {"running", "timed_out"})
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=5,
+                return_on="interesting",
+                include_status=False,
+            )
+            elapsed = time.monotonic() - started_at
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(result["wait_return_reason"], "first_change_seen")
+        self.assertTrue(result["interesting_update"])
+
+    def test_wait_interesting_returns_for_terminal(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            started_at = time.monotonic()
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+            )
+            elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(result["wait_return_reason"], "terminal_status")
+        self.assertTrue(result["interesting_update"])
+
 
 class OpenCodeCoderIntegrationTests(unittest.TestCase):
     def setUp(self):

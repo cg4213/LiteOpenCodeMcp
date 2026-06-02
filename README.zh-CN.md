@@ -113,8 +113,15 @@ python -B -m unittest -v test_opencode_coder.py
 - 默认复用 `server_id`，不要默认复用 `session_id`。只有明确需要延续 OpenCode 会话上下文时才传 `session_id`、`continue_last` 或 `fork_session`；不要跨不同 `working_dir` 或不同仓库根目录复用 session。
 - 受控复用 session 的建议边界：同一 `working_dir`、同一 feature/topic、上一 job 没有 `no_event_noop_risk`、上一 job 没有异常 terminal status，并且用户或 Feature Owner 明确允许连续上下文；不要跨 Unity 项目或仓库根复用。
 - 大工作提示词应拆小成多步 job：每轮只交付一个明确目标，完成后 review 再派发下一轮，避免长时间卡在读取/规划阶段。
-- 长任务优先使用 `wait_policy="start_only"` 或 `"first_output"`，让主对话尽快拿回控制权，再用 compact status 轮询。
-- 轮询时优先使用 `caller_update_recommended`、`caller_update_reason`、`next_poll_after_seconds` 控制汇报频率：派发后第一次状态查询建议等 60-90 秒，后续按 `next_poll_after_seconds` 或 45-90 秒节奏轮询；普通 running 且只有近期普通活动时可静默继续；terminal、首次变更、stalled、policy violation、验证观察、no-event no-op 风险等才值得汇报。
+- 长任务优先使用 `wait_policy="start_only"` 或 `"first_output"`，让主对话尽快拿回控制权，
+  再用 `opencode_coder_wait` 等待关键变化或 compact status 轮询。
+- 轮询时优先使用 `caller_update_recommended`、`caller_update_reason`、`next_poll_after_seconds`
+  控制汇报频率：派发后先用轻量等待获取第一个信号：
+  `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)`
+  只返回 `job_id`、`status` 和 wait 结果；当 wait 发现 interesting 更新（如 terminal、首次变更、
+  stalled、policy violation）后，再按需调用 `opencode_coder_status` 获取完整诊断快照。
+  后续按 `next_poll_after_seconds` 或 45-90 秒节奏轮询；普通 running 且只有近期普通活动时可静默继续；
+  terminal、首次变更、stalled、policy violation、验证观察、no-event no-op 风险等才值得汇报。
 - 普通轮询不要传 `include_tail`、`include_output`、`include_delta`。这些是调试开关，只有需要看原始 stdout/stderr 或 event 流时才打开，并配合字符上限。
 - 不要只因 `status=completed` 或 `success=true` 就接受结果。完成后必须看 `suggested_action`、`work_summary_text`、变更文件、path policy、stall/risk、`no_event_noop_risk` 和 validation 字段。
 - 如果 `no_event_noop_risk=true`，应不传 `session_id` 重试，或新开 session/server；不要把它当作正常完成。
@@ -124,10 +131,11 @@ python -B -m unittest -v test_opencode_coder.py
 
 1. 用 `opencode_server_start` 启动一个 managed OpenCode server。
 2. 用 `opencode_coder(..., server_id=..., wait_policy="start_only")` 派发任务，尽快拿到 `job_id`。
-3. 用 `opencode_coder_status(job_id, wait_seconds=...)` 观察进度。
-4. 用 `opencode_coder_diff(job_id)` 审查本 job 涉及的变更。
-5. 需要中止时调用 `opencode_coder_cancel(job_id)`。
-6. 新对话或 MCP 重启后，用 `opencode_server_list` 找回可复用的 managed server。
+3. 用 `opencode_coder_wait(job_id, wait_seconds=90, return_on="interesting", include_status=false)` 轻量等待关键变化。
+4. wait 返回 `interesting_update=true` 后，再用 `opencode_coder_status(job_id)` 获取完整诊断；如果 wait 不可用或需要 cursor/delta 调试，再回退到 compact status 轮询。
+5. 用 `opencode_coder_diff(job_id)` 审查本 job 涉及的变更。
+6. 需要中止时调用 `opencode_coder_cancel(job_id)`。
+7. 新对话或 MCP 重启后，用 `opencode_server_list` 找回可复用的 managed server。
 
 如果不传 `server_id`，`opencode_coder` 仍保持直接执行 `opencode run` 的兼容行为。
 
@@ -179,7 +187,7 @@ opencode run --attach <server_url> --dir <working_dir> --format json --dangerous
 - `"first_output"`：等到 stdout/stderr 有输出、进程完成或超时。
 - `"first_change"`：等到 `new_changed_files` 非空、进程完成或超时。
 
-长任务建议使用 `"start_only"` 或 `"first_output"`，让调用方尽快恢复控制权，再通过 `opencode_coder_status` 轮询。
+长任务建议使用 `"start_only"` 或 `"first_output"`，让调用方尽快恢复控制权，再用 `opencode_coder_wait(..., include_status=false)` 进行轻量长轮询。只有 wait 返回 interesting 更新，或需要完整诊断时，再调用 `opencode_coder_status`。
 
 默认 `opencode_coder` 返回 compact 工作反馈：`status`、`success`、`suggested_action`、`summary`、`work_summary_text` / `last_text_output`、变更文件列表、风险字段、轻量诊断和 cursor 元数据。默认不返回 OpenCode 原始 stdout/stderr tail、stdout JSON event 流、delta 文本或旧字段 `output` 的大内容；需要调试时必须显式打开上面的参数。
 
@@ -464,6 +472,46 @@ failed、cancelled、timed_out 都不具备原子性；如果它们留下文件�
 prompt 里要求 OpenCode 运行验证，不代表验证真的执行了。job 未 `completed` 时，prompt 内要求的验证很可能没有执行。调用方必须查看实际 stdout/stderr、OpenCode report 或本地验证结果。
 普通模型文本、README 内容、报告内容或普通 stdout 只是提到 `python -m py_compile`、`debug_check_compilation`、`git diff --check` 等命令时，不算验证执行。`read`、`open`、`grep`、`rg`、`search`、`glob`、`ls`、`get-childitem` 等读取/搜索/列表工具读到这些命令，也不算验证执行。`observed_validation_result` 没看到验证执行型工具活动时为 `none`；看到命令/工具但无法保守判断结果时为 `inconclusive`；能看到 Unity console `0 errors`、测试通过等明确标记时才为 `passed`；能看到失败或非零错误数时为 `failed`。同一观察窗口里同时存在 passed-looking 和 failed-looking 信号时，wrapper 优先返回 `failed` 或 `inconclusive`，避免误报 `passed`。
 
+### `opencode_coder_wait`
+
+长轮询工具，在单次 MCP 工具调用内部等待 job 出现"值得关注的变化"或等待超时后再返回。
+它用于减少频繁 `opencode_coder_status` 轮询带来的 token 浪费，把多次 status 查询合并为一次等待。
+
+参数：
+
+- `job_id`：`opencode_coder` 返回的 job id。
+- `wait_seconds`：最大等待秒数，限制在 `0..600` 秒，默认 `90`。上限保守，避免极端 MCP 工具调用超时。
+- `return_on`：触发返回的事件类型：
+  - `"interesting"`（默认）：等待 `caller_update_recommended=true`、terminal 状态、首次文件变更、policy violation、stalled、no_event_noop_risk、observed validation passed/failed 等任何值得关注的变化。超时时返回 `wait_timeout`。
+  - `"terminal"`：只等待 `completed` / `failed` / `cancelled`。不把 running 或首次文件变更当作触发条件。
+- `include_status`：默认 `true`，返回与 `opencode_coder_status` 兼容的完整状态快照加上 wait 专属字段。设 `false` 时只返回 `job_id`、`status` 和 wait 专属字段。轻量轮询应使用 `include_status=false` 节省 token；只有 wait 返回 interesting 更新时再调用 `opencode_coder_status` 获取完整诊断。
+- `include_tail`、`include_output`、`include_delta`：调试开关，与 `opencode_coder_status` 一致，默认 `false` 保持输出紧凑。
+
+wait 专属返回字段：
+
+- `wait_return_reason`：等待返回原因。可能的值：
+  - `terminal_status` — job 达到 completed/failed/cancelled。
+  - `first_change_seen` — 本次等待窗口内出现了新的文件变更（不是前一次 opencode_coder 或 opencode_coder_wait 调用已观察到的旧变更）。
+  - `caller_update_recommended`（或其底层原因如 `stalled`、`policy_violation`、`no_event_noop_risk`、`validation_observed`）— 进度诊断触发了 caller update。
+  - `wait_timeout` — 等待窗口到期，无关键变化。
+  - `not_found` — job_id 未找到。
+- `interesting_update`：`true` 表示检测到有意义的变化；`false` 表示等待超时无新信号。
+- `waited_seconds`：实际等待的秒数。
+
+超时时（`wait_return_reason="wait_timeout"`、`interesting_update=false`）返回 compact heartbeat：
+job 可能仍 running，`caller_update_recommended` 通常为 `false`，raw tail/delta/output 默认空。
+
+`job_id` 未找到时立即返回，不等待。
+
+与 `opencode_coder_status` 的区别：
+
+- `opencode_coder_status` 是即时快照查询，可选短 `wait_seconds`（max 30s），用于简单输出/变更检测。
+- `opencode_coder_wait` 是长轮询工具（max 600s），可在一次调用内过滤到更高级别的"interesting"事件，
+  替代多次 status 轮询。
+- `opencode_coder_wait` 不支持 stdout/stderr cursor 参数；需要 cursor 驱动的 delta 轮询时用
+  `opencode_coder_status`。
+- `opencode_coder_wait` 不是 MCP 主动推送通知——它是一次会阻塞主对话的工具调用。
+
 ### `opencode_coder_diff`
 
 基于某个 `opencode_coder` job 的 `new_changed_files` 返回有界 git diff，方便 review。
@@ -725,11 +773,11 @@ git -C <working_dir> -c core.quotepath=false status --porcelain=v1 --untracked-f
 - `output`
 - `return_code`
 
-新调用方建议优先使用 `status`、`exit_code`、`suggested_action`、`work_summary_text`、`new_changed_files`、风险字段和 `opencode_coder_diff`。轮询场景默认使用 compact status 和 cursor 元数据，避免重复传输完整 tail。`stdout_delta` / `stderr_delta` 与 `recent_events` 主要是调试诊断字段，不应作为普通调用链默认消费。只有需要调试时才传 `include_tail=true` 或 `include_delta=true`；旧字段 `output` 也只有传 `include_output=true` 时才会返回内容。
+新调用方建议优先使用 `status`、`exit_code`、`suggested_action`、`work_summary_text`、`new_changed_files`、风险字段和 `opencode_coder_diff`。普通观察循环优先使用 `opencode_coder_wait(..., include_status=false)`；只有 wait 返回 interesting 更新，或需要完整诊断时，再拉 compact status 和 cursor 元数据，避免重复传输完整 tail。`stdout_delta` / `stderr_delta` 与 `recent_events` 主要是调试诊断字段，不应作为普通调用链默认消费。只有需要调试时才传 `include_tail=true` 或 `include_delta=true`；旧字段 `output` 也只有传 `include_output=true` 时才会返回内容。
 
 ## 真实 OpenCode Smoke Test
 
-真实集成 smoke test 默认跳过，需要显式开启。它会启动 managed `opencode serve`，通过 `--attach` 调用 `opencode_coder`，轮询 `opencode_coder_status`，并在临时 git 仓库中验证 snapshot 字段。
+真实集成 smoke test 默认跳过，需要显式开启。它会启动 managed `opencode serve`，通过 `--attach` 调用 `opencode_coder`，轮询 `opencode_coder_status`，并在临时 git 仓库中验证 snapshot 字段。`opencode_coder_wait` 当前由单元/fake 子进程测试覆盖；发布前如需声明真实集成覆盖，应补一次真实 wait smoke。
 
 这个测试可能触发真实模型调用，依赖网络、认证、OpenCode provider 配置和相关费用。测试只写入 `TemporaryDirectory`，不会触碰用户项目。
 
@@ -750,3 +798,5 @@ Remove-Item Env:\OPENCODE_CODER_RUN_INTEGRATION
 - 用真实子进程树增强跨平台 process-tree cleanup 验证。
 - 从 OpenCode 输出中提取更详细的测试和验证信息。
 - policy violation 的自动回滚或清理。
+- `opencode_coder_wait` 目前通过周期 `refresh_job_snapshot` + 诊断重建来检测 interesting 信号；
+  未来可考虑使用专用 threading Events 加速 stall/validation/noop 检测。

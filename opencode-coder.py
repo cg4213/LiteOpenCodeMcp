@@ -32,6 +32,10 @@ DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_MAX_MCP_WAIT_SECONDS = 110.0
 DEFAULT_FINISHED_JOB_TTL_SECONDS = 3600.0
 MAX_STATUS_WAIT_SECONDS = 30.0
+DEFAULT_WAIT_WAIT_SECONDS = 90.0
+MAX_WAIT_WAIT_SECONDS = 600.0
+WAIT_POLL_INTERVAL = 0.5
+VALID_RETURN_ON = {"interesting", "terminal"}
 DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 MAX_FINISHED_JOBS = 100
 DEFAULT_DIFF_MAX_CHARS = 20_000
@@ -388,6 +392,16 @@ def clamp_wait_seconds(wait_seconds: float | int | None) -> float:
     except (TypeError, ValueError):
         return 0.0
     return min(max(parsed, 0.0), MAX_STATUS_WAIT_SECONDS)
+
+
+def clamp_wait_wait_seconds(wait_seconds: float | int | None) -> float:
+    if wait_seconds is None:
+        return DEFAULT_WAIT_WAIT_SECONDS
+    try:
+        parsed = float(wait_seconds)
+    except (TypeError, ValueError):
+        return DEFAULT_WAIT_WAIT_SECONDS
+    return min(max(parsed, 0.0), MAX_WAIT_WAIT_SECONDS)
 
 
 def clamp_diff_max_chars(max_chars) -> int:
@@ -2218,6 +2232,82 @@ def wait_for_status_activity(job: OpenCodeJob, wait_seconds: float) -> None:
         if remaining <= 0:
             return
         time.sleep(min(0.1, remaining))
+
+
+def wait_for_update(
+    job: OpenCodeJob,
+    wait_seconds: float,
+    return_on: str,
+) -> dict:
+    wait_seconds = clamp_wait_wait_seconds(wait_seconds)
+    return_on = return_on if return_on in VALID_RETURN_ON else "interesting"
+
+    with job.lock:
+        prev_change_version = job.change_version
+
+    deadline = time.monotonic() + wait_seconds
+    started_at = time.monotonic()
+    first_change_during_wait = False
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        if return_on == "terminal":
+            if job.done_event.wait(min(WAIT_POLL_INTERVAL, remaining)):
+                break
+            continue
+
+        refresh_job_snapshot(job)
+        with job.lock:
+            if job.change_version != prev_change_version:
+                prev_change_version = job.change_version
+                first_change_during_wait = True
+            if job.done_event.is_set():
+                break
+            if job.policy_violation:
+                break
+
+        result = job_to_result(job)
+        if result["caller_update_recommended"]:
+            if result["caller_update_reason"] == "first_change_seen" and not first_change_during_wait:
+                pass
+            else:
+                waited = round(time.monotonic() - started_at, 3)
+                return {
+                    "wait_return_reason": result["caller_update_reason"],
+                    "interesting_update": True,
+                    "waited_seconds": waited,
+                }
+
+        job.done_event.wait(min(WAIT_POLL_INTERVAL, max(remaining, 0)))
+
+    final = job_to_result(job)
+    waited = round(time.monotonic() - started_at, 3)
+
+    if final["status"] in {"completed", "failed", "cancelled"}:
+        if first_change_during_wait:
+            reason = "first_change_seen"
+        else:
+            reason = "terminal_status"
+        interesting = True
+    elif final["caller_update_recommended"]:
+        if final["caller_update_reason"] == "first_change_seen" and not first_change_during_wait:
+            reason = "wait_timeout"
+            interesting = False
+        else:
+            reason = final["caller_update_reason"]
+            interesting = True
+    else:
+        reason = "wait_timeout"
+        interesting = False
+
+    return {
+        "wait_return_reason": reason,
+        "interesting_update": interesting,
+        "waited_seconds": waited,
+    }
 
 
 def cleanup_jobs() -> None:
@@ -4115,6 +4205,72 @@ def opencode_coder_status(
         delta_max_chars=clamp_delta_max_chars(delta_max_chars),
         tail_max_chars=clamp_tail_max_chars(tail_max_chars, default=DEFAULT_STATUS_TAIL_MAX_CHARS),
     )
+
+
+@mcp.tool()
+def opencode_coder_wait(
+    job_id: str,
+    wait_seconds: float = DEFAULT_WAIT_WAIT_SECONDS,
+    return_on: str = "interesting",
+    include_status: bool = True,
+    include_tail: bool = False,
+    include_output: bool = False,
+    include_delta: bool = False,
+    recent_events_limit: int = DEFAULT_RECENT_EVENTS_LIMIT,
+    delta_max_chars: int | None = None,
+    tail_max_chars: int | None = None,
+) -> dict:
+    """长轮询等待 opencode_coder job 出现值得关注的变化，减少频繁 status 查询的 token 浪费。
+
+    这是一次会阻塞主对话的 MCP 工具调用，不是 MCP 主动通知用户。
+    在单次工具调用内部等待 job 达到 terminal、首次文件变更、policy violation、
+    stalled、no_event_noop_risk、observed validation passed/failed 或 caller_update_recommended，
+    或等待超时后再返回。
+
+    wait_seconds 会被限制在 0..600 秒。默认 90 秒。
+    return_on 默认 \"interesting\" 等待任何值得关注的变化；传 \"terminal\" 只等待 completed/failed/cancelled。
+    include_status 默认 true，返回完整的 job 状态快照；传 false 只返回 wait 相关字段。
+    include_tail/include_output/include_delta 是调试开关，默认 false 保持输出紧凑。
+    """
+    cleanup_jobs()
+    with _REGISTRY_LOCK:
+        job = _JOBS.get(job_id)
+
+    if job is None:
+        if include_status:
+            result = make_job_not_found_result(job_id)
+        else:
+            result = {"job_id": job_id, "status": "not_found"}
+        result["wait_return_reason"] = "not_found"
+        result["interesting_update"] = True
+        result["waited_seconds"] = 0.0
+        return result
+
+    effective_wait = clamp_wait_wait_seconds(wait_seconds)
+    wait_info = wait_for_update(job, effective_wait, return_on)
+
+    if include_status:
+        result = job_to_result(
+            job,
+            new_job_started=False,
+            include_tail=bool(include_tail),
+            include_output=bool(include_output),
+            include_delta=bool(include_delta),
+            recent_events_limit=clamp_recent_events_limit(recent_events_limit),
+            delta_max_chars=clamp_delta_max_chars(delta_max_chars),
+            tail_max_chars=clamp_tail_max_chars(tail_max_chars, default=DEFAULT_STATUS_TAIL_MAX_CHARS),
+        )
+        result.update(wait_info)
+        return result
+
+    with job.lock:
+        status = job.status
+    minimal = {
+        "job_id": job_id,
+        "status": status,
+    }
+    minimal.update(wait_info)
+    return minimal
 
 
 @mcp.tool()
