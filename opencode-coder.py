@@ -29,10 +29,12 @@ MAX_TAIL_CHARS = 12_000
 DEFAULT_STATUS_TAIL_MAX_CHARS = 4_000
 MAX_DELTA_BUFFER_CHARS = 64_000
 DEFAULT_WAIT_SECONDS = 120.0
-DEFAULT_MAX_MCP_WAIT_SECONDS = 110.0
+DEFAULT_MCP_CLIENT_TIMEOUT_SECONDS = 240.0
+DEFAULT_MCP_WAIT_MARGIN_SECONDS = 25.0
+DEFAULT_MAX_MCP_WAIT_SECONDS = 215.0
 DEFAULT_FINISHED_JOB_TTL_SECONDS = 3600.0
 MAX_STATUS_WAIT_SECONDS = 30.0
-DEFAULT_WAIT_WAIT_SECONDS = 120.0
+DEFAULT_WAIT_WAIT_SECONDS = DEFAULT_MAX_MCP_WAIT_SECONDS
 MAX_WAIT_WAIT_SECONDS = 600.0
 WAIT_POLL_INTERVAL = 0.5
 VALID_RETURN_ON = {"interesting", "terminal"}
@@ -73,6 +75,42 @@ OBSERVED_VALIDATION_TOOL_ORDER = (
     "git_diff_check",
     "unknown_test_command",
 )
+DEFAULT_OPENCODE_MODEL = "deepseek/deepseek-v4-pro"
+DEFAULT_OPENCODE_VARIANT = "max"
+WAIT_COMPACT_SNAPSHOT_FIELDS = (
+    "job_id",
+    "status",
+    "success",
+    "error",
+    "working_dir",
+    "exit_code",
+    "summary",
+    "work_summary_text",
+    "assistant_last_text",
+    "last_text_output",
+    "new_changed_files",
+    "all_changed_files",
+    "preexisting_changed_files",
+    "policy_violation",
+    "extra_changed_files",
+    "forbidden_changed_files",
+    "validation_status",
+    "validation_note",
+    "observed_validation_summary",
+    "progress_phase",
+    "progress_message",
+    "caller_update_recommended",
+    "caller_update_reason",
+    "next_poll_after_seconds",
+    "is_stalled",
+    "stall_reason",
+    "no_event_noop_risk",
+    "suggested_action",
+    "requested_model",
+    "requested_variant",
+    "requested_agent",
+    "requested_show_thinking",
+)
 
 _JOBS: dict[str, "OpenCodeJob"] = {}
 _CWD_ACTIVE_JOBS: dict[str, set[str]] = {}
@@ -112,6 +150,10 @@ class OpenCodeJob:
     fork_session: bool = False
     attached_to_server: bool = False
     server_recovered_from_registry: bool = False
+    requested_model: str | None = DEFAULT_OPENCODE_MODEL
+    requested_variant: str | None = DEFAULT_OPENCODE_VARIANT
+    requested_agent: str | None = None
+    requested_show_thinking: bool = False
     status: str = "starting"
     pid: int | None = None
     exit_code: int | None = None
@@ -232,6 +274,24 @@ def resolve_opencode() -> str:
     return shutil.which("opencode") or shutil.which("opencode.cmd") or "opencode"
 
 
+def append_opencode_run_option_flags(
+    cmd: list[str],
+    *,
+    model: str | None = DEFAULT_OPENCODE_MODEL,
+    variant: str | None = DEFAULT_OPENCODE_VARIANT,
+    agent: str | None = None,
+    show_thinking: bool = False,
+) -> None:
+    if model:
+        cmd.extend(["--model", model])
+    if variant:
+        cmd.extend(["--variant", variant])
+    if agent:
+        cmd.extend(["--agent", agent])
+    if show_thinking:
+        cmd.append("--thinking")
+
+
 def build_opencode_command(
     prompt: str,
     *,
@@ -241,6 +301,10 @@ def build_opencode_command(
     continue_last: bool = False,
     fork_session: bool = False,
     title: str | None = None,
+    model: str | None = DEFAULT_OPENCODE_MODEL,
+    variant: str | None = DEFAULT_OPENCODE_VARIANT,
+    agent: str | None = None,
+    show_thinking: bool = False,
 ) -> list[str]:
     cmd = [
         resolve_opencode(),
@@ -256,6 +320,13 @@ def build_opencode_command(
         "json",
         "--dangerously-skip-permissions",
     ])
+    append_opencode_run_option_flags(
+        cmd,
+        model=model,
+        variant=variant,
+        agent=agent,
+        show_thinking=show_thinking,
+    )
 
     if session_id:
         cmd.extend(["--session", session_id])
@@ -296,11 +367,23 @@ def env_float(name: str, default_value: float) -> float:
     return max(0.0, parsed)
 
 
+def default_mcp_wait_budget_seconds() -> float:
+    client_timeout = env_float(
+        "OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS",
+        DEFAULT_MCP_CLIENT_TIMEOUT_SECONDS,
+    )
+    margin = env_float(
+        "OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS",
+        DEFAULT_MCP_WAIT_MARGIN_SECONDS,
+    )
+    return max(0.0, client_timeout - margin)
+
+
 def compute_effective_timeout(timeout_seconds: float | int | None) -> tuple[float, float, str]:
     requested = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
     requested = max(0.0, requested)
 
-    max_wait = env_float("OPENCODE_CODER_MAX_WAIT_SECONDS", DEFAULT_MAX_MCP_WAIT_SECONDS)
+    max_wait = env_float("OPENCODE_CODER_MAX_WAIT_SECONDS", default_mcp_wait_budget_seconds())
     effective = min(requested, max_wait)
     if requested > effective:
         policy = (
@@ -309,6 +392,24 @@ def compute_effective_timeout(timeout_seconds: float | int | None) -> tuple[floa
         )
     else:
         policy = "requested_timeout_seconds"
+    return requested, effective, policy
+
+
+def effective_mcp_wait_cap_seconds() -> float:
+    return min(
+        env_float("OPENCODE_CODER_MAX_WAIT_SECONDS", default_mcp_wait_budget_seconds()),
+        MAX_WAIT_WAIT_SECONDS,
+    )
+
+
+def compute_effective_wait_wait_seconds(wait_seconds: float | int | None) -> tuple[float, float, str]:
+    requested = clamp_wait_wait_seconds(wait_seconds)
+    cap = effective_mcp_wait_cap_seconds()
+    effective = min(requested, cap)
+    if requested > effective:
+        policy = "capped_by_wrapper_to_return_before_mcp_client_timeout"
+    else:
+        policy = "requested_wait_seconds"
     return requested, effective, policy
 
 
@@ -3430,6 +3531,10 @@ def job_to_result(
             "preexisting_dirty_warning": change_risk_fields["preexisting_dirty_warning"],
             "command": job.command_summary,
             "wait_policy": job.wait_policy,
+            "requested_model": job.requested_model,
+            "requested_variant": job.requested_variant,
+            "requested_agent": job.requested_agent,
+            "requested_show_thinking": job.requested_show_thinking,
             "requested_timeout_seconds": job.requested_timeout_seconds,
             "effective_timeout_seconds": job.effective_timeout_seconds,
             "timeout_policy": job.timeout_policy,
@@ -3551,6 +3656,10 @@ def make_job_not_found_result(job_id: str) -> dict:
         "preexisting_dirty_warning": "",
         "command": None,
         "wait_policy": None,
+        "requested_model": None,
+        "requested_variant": None,
+        "requested_agent": None,
+        "requested_show_thinking": False,
         "requested_timeout_seconds": None,
         "effective_timeout_seconds": None,
         "timeout_policy": None,
@@ -3592,6 +3701,10 @@ def make_start_failed_result(
     attached_to_server: bool,
     error: str,
     server_recovered_from_registry: bool = False,
+    model: str | None = DEFAULT_OPENCODE_MODEL,
+    variant: str | None = DEFAULT_OPENCODE_VARIANT,
+    agent: str | None = None,
+    show_thinking: bool = False,
 ) -> dict:
     job = OpenCodeJob(
         job_id=uuid.uuid4().hex,
@@ -3613,6 +3726,10 @@ def make_start_failed_result(
         fork_session=fork_session,
         attached_to_server=attached_to_server,
         server_recovered_from_registry=server_recovered_from_registry,
+        requested_model=model,
+        requested_variant=variant,
+        requested_agent=agent,
+        requested_show_thinking=bool(show_thinking),
         status="failed",
         exit_code=None,
         finished_at=utc_now(),
@@ -3638,6 +3755,10 @@ def start_job(
     continue_last: bool,
     fork_session: bool,
     title: str | None,
+    model: str | None,
+    variant: str | None,
+    agent: str | None,
+    show_thinking: bool,
 ) -> tuple[OpenCodeJob | None, dict | None]:
     cleanup_jobs()
     requested_timeout, effective_timeout, timeout_policy = compute_effective_timeout(timeout_seconds)
@@ -3655,8 +3776,15 @@ def start_job(
                 "run",
                 "--attach",
                 f"<missing server_id={server_id}>",
-                f"<prompt chars={len(prompt)}>",
             ]
+            append_opencode_run_option_flags(
+                command,
+                model=model,
+                variant=variant,
+                agent=agent,
+                show_thinking=show_thinking,
+            )
+            command.append(f"<prompt chars={len(prompt)}>")
             error = f"server_id not found: {server_id}"
             if registry_error:
                 error = f"{error}; {registry_error}"
@@ -3678,6 +3806,10 @@ def start_job(
                 fork_session=fork_session,
                 attached_to_server=False,
                 error=error,
+                model=model,
+                variant=variant,
+                agent=agent,
+                show_thinking=show_thinking,
             )
             return None, result
 
@@ -3694,6 +3826,10 @@ def start_job(
                     continue_last=continue_last,
                     fork_session=fork_session,
                     title=title,
+                    model=model,
+                    variant=variant,
+                    agent=agent,
+                    show_thinking=show_thinking,
                 ),
                 command_summary=(
                     f"{Path(resolve_opencode()).name} run --attach {server.url} "
@@ -3713,6 +3849,10 @@ def start_job(
                 attached_to_server=True,
                 error=f"server_id is not running: {server_id}",
                 server_recovered_from_registry=server.recovered_from_registry,
+                model=model,
+                variant=variant,
+                agent=agent,
+                show_thinking=show_thinking,
             )
             return None, result
         server_url = server.url
@@ -3727,6 +3867,10 @@ def start_job(
         continue_last=continue_last,
         fork_session=fork_session,
         title=title,
+        model=model,
+        variant=variant,
+        agent=agent,
+        show_thinking=show_thinking,
     )
     command_summary = summarize_command(command, prompt)
 
@@ -3750,6 +3894,10 @@ def start_job(
             attached_to_server=attached_to_server,
             server_recovered_from_registry=server_recovered_from_registry,
             error=f"working_dir does not exist or is not a directory: {resolved_working_dir}",
+            model=model,
+            variant=variant,
+            agent=agent,
+            show_thinking=show_thinking,
         )
         return None, result
 
@@ -3788,6 +3936,10 @@ def start_job(
             fork_session=fork_session,
             attached_to_server=attached_to_server,
             server_recovered_from_registry=server_recovered_from_registry,
+            requested_model=model,
+            requested_variant=variant,
+            requested_agent=agent,
+            requested_show_thinking=bool(show_thinking),
             summary="OpenCode process is starting.",
         )
         initial_snapshot = collect_git_status(resolved_working_dir)
@@ -4080,6 +4232,10 @@ def opencode_coder(
     continue_last: bool = False,
     fork_session: bool = False,
     title: str | None = None,
+    model: str | None = DEFAULT_OPENCODE_MODEL,
+    variant: str | None = DEFAULT_OPENCODE_VARIANT,
+    agent: str | None = None,
+    show_thinking: bool = False,
     include_tail: bool = False,
     include_output: bool = False,
     include_delta: bool = False,
@@ -4101,6 +4257,10 @@ def opencode_coder(
         continue_last,
         fork_session,
         title,
+        model,
+        variant,
+        agent,
+        bool(show_thinking),
     )
     if early_result is not None:
         if job is not None:
@@ -4223,6 +4383,84 @@ def opencode_coder_status(
     )
 
 
+def compact_wait_snapshot(status_result: dict) -> dict:
+    return {field: status_result.get(field) for field in WAIT_COMPACT_SNAPSHOT_FIELDS}
+
+
+def wait_status_refresh_reason(
+    status_result: dict,
+    wait_info: dict,
+    *,
+    include_tail: bool,
+    include_output: bool,
+    include_delta: bool,
+) -> str | None:
+    wait_reason = wait_info.get("wait_return_reason")
+    status = status_result.get("status")
+    if status == "not_found":
+        return None
+    if include_tail or include_output or include_delta:
+        return "debug_output_requested"
+    if wait_reason == "terminal_status" and status not in {"completed", "failed", "cancelled"}:
+        return "wait_reason_status_mismatch"
+    if wait_reason == "first_change_seen" and not status_result.get("new_changed_files"):
+        return "first_change_without_snapshot_files"
+    if status_result.get("policy_violation") and not (
+        status_result.get("extra_changed_files") or status_result.get("forbidden_changed_files")
+    ):
+        return "policy_violation_without_file_details"
+    if status_result.get("is_stalled") and not status_result.get("stall_reason"):
+        return "stalled_without_reason"
+    if status_result.get("no_event_noop_risk") and not status_result.get("diagnostic_note"):
+        return "noop_risk_without_diagnostics"
+    if wait_reason == "validation_observed" and not status_result.get("observed_validation_summary"):
+        return "validation_observed_without_summary"
+    return None
+
+
+def wait_suggested_next_tool(status_result: dict, wait_info: dict, needs_status_refresh: bool) -> str:
+    if needs_status_refresh:
+        return "opencode_coder_status"
+
+    wait_reason = wait_info.get("wait_return_reason")
+    status = status_result.get("status")
+    has_changes = bool(status_result.get("new_changed_files") or status_result.get("all_changed_files"))
+
+    if status == "not_found":
+        return "none"
+    if status_result.get("policy_violation") or wait_reason == "policy_violation":
+        return "opencode_coder_diff"
+    if status_result.get("no_event_noop_risk"):
+        return "opencode_coder"
+    if status_result.get("is_stalled"):
+        return "opencode_coder_diff" if has_changes else "opencode_coder_cancel"
+    if status in {"completed", "failed", "cancelled"}:
+        return "opencode_coder_diff" if has_changes else "none"
+    return "opencode_coder_wait"
+
+
+def add_wait_guidance_fields(
+    result: dict,
+    status_result: dict,
+    wait_info: dict,
+    *,
+    include_tail: bool,
+    include_output: bool,
+    include_delta: bool,
+) -> None:
+    refresh_reason = wait_status_refresh_reason(
+        status_result,
+        wait_info,
+        include_tail=include_tail,
+        include_output=include_output,
+        include_delta=include_delta,
+    )
+    needs_status_refresh = refresh_reason is not None
+    result["needs_status_refresh"] = needs_status_refresh
+    result["suggested_next_tool"] = wait_suggested_next_tool(status_result, wait_info, needs_status_refresh)
+    result["status_refresh_reason"] = refresh_reason or "compact_snapshot_sufficient"
+
+
 @mcp.tool()
 def opencode_coder_wait(
     job_id: str,
@@ -4243,50 +4481,64 @@ def opencode_coder_wait(
     stalled、no_event_noop_risk、observed validation passed/failed 或 caller_update_recommended，
     或等待超时后再返回。
 
-    wait_seconds 会被限制在 0..600 秒。默认 120 秒。
+    wait_seconds 会先被限制在 0..600 秒，再按 MCP 客户端超时预算和安全边距裁剪。
     return_on 默认 \"interesting\" 等待任何值得关注的变化；传 \"terminal\" 只等待 completed/failed/cancelled。
-    include_status 默认 true，返回完整的 job 状态快照；传 false 只返回 wait 相关字段。
+    include_status 默认 true，返回完整的 job 状态快照；传 false 仍返回 compact snapshot 加 wait 引导字段。
     include_tail/include_output/include_delta 是调试开关，默认 false 保持输出紧凑。
     """
+    requested_wait, effective_wait, wait_timeout_policy = compute_effective_wait_wait_seconds(wait_seconds)
     cleanup_jobs()
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)
 
     if job is None:
-        if include_status:
-            result = make_job_not_found_result(job_id)
-        else:
-            result = {"job_id": job_id, "status": "not_found"}
+        status_result = make_job_not_found_result(job_id)
+        result = status_result if include_status else compact_wait_snapshot(status_result)
         result["wait_return_reason"] = "not_found"
         result["interesting_update"] = True
         result["waited_seconds"] = 0.0
-        return result
-
-    effective_wait = clamp_wait_wait_seconds(wait_seconds)
-    wait_info = wait_for_update(job, effective_wait, return_on)
-
-    if include_status:
-        result = job_to_result(
-            job,
-            new_job_started=False,
+        result["requested_wait_seconds"] = requested_wait
+        result["effective_wait_seconds"] = effective_wait
+        result["wait_timeout_policy"] = wait_timeout_policy
+        add_wait_guidance_fields(
+            result,
+            status_result,
+            result,
             include_tail=bool(include_tail),
             include_output=bool(include_output),
             include_delta=bool(include_delta),
-            recent_events_limit=clamp_recent_events_limit(recent_events_limit),
-            delta_max_chars=clamp_delta_max_chars(delta_max_chars),
-            tail_max_chars=clamp_tail_max_chars(tail_max_chars, default=DEFAULT_STATUS_TAIL_MAX_CHARS),
         )
-        result.update(wait_info)
         return result
 
-    with job.lock:
-        status = job.status
-    minimal = {
-        "job_id": job_id,
-        "status": status,
-    }
-    minimal.update(wait_info)
-    return minimal
+    wait_info = wait_for_update(job, effective_wait, return_on)
+    wait_info["requested_wait_seconds"] = requested_wait
+    wait_info["effective_wait_seconds"] = effective_wait
+    wait_info["wait_timeout_policy"] = wait_timeout_policy
+
+    status_result = job_to_result(
+        job,
+        new_job_started=False,
+        include_tail=bool(include_tail),
+        include_output=bool(include_output),
+        include_delta=bool(include_delta),
+        recent_events_limit=clamp_recent_events_limit(recent_events_limit),
+        delta_max_chars=clamp_delta_max_chars(delta_max_chars),
+        tail_max_chars=clamp_tail_max_chars(tail_max_chars, default=DEFAULT_STATUS_TAIL_MAX_CHARS),
+    )
+    if include_status:
+        result = status_result
+    else:
+        result = compact_wait_snapshot(status_result)
+    result.update(wait_info)
+    add_wait_guidance_fields(
+        result,
+        status_result,
+        wait_info,
+        include_tail=bool(include_tail),
+        include_output=bool(include_output),
+        include_delta=bool(include_delta),
+    )
+    return result
 
 
 @mcp.tool()

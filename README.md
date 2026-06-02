@@ -93,7 +93,8 @@ configuration looks like:
       "command": "D:\\Develop\\LiteOpenCodeMcp\\.venv\\Scripts\\python.exe",
       "args": ["D:\\Develop\\LiteOpenCodeMcp\\opencode-coder.py"],
       "env": {
-        "OPENCODE_CODER_MAX_WAIT_SECONDS": "110",
+        "OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS": "300",
+        "OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS": "25",
         "OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS": "3600"
       }
     }
@@ -106,7 +107,14 @@ restart the MCP client or the MCP server process so the new schema is loaded.
 
 Optional environment variables:
 
-- `OPENCODE_CODER_MAX_WAIT_SECONDS`: caps synchronous MCP wait time. Default `110`.
+- `OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS`: client timeout budget used when the
+  explicit max wait env var is not set. Default `240`. For wait-only usage, configure
+  the MCP client timeout to `300` seconds and set this variable to `300`.
+- `OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS`: safety margin subtracted from the client
+  timeout budget. Default `25`.
+- `OPENCODE_CODER_MAX_WAIT_SECONDS`: optional final cap for synchronous MCP wait time.
+  Leave it unset for the timeout-minus-margin calculation, or set it to `275` when
+  the MCP client timeout is configured to `300`.
 - `OPENCODE_CODER_FINISHED_JOB_TTL_SECONDS`: finished job retention window. Default
   `3600`.
 - `OPENCODE_CODER_REGISTRY_PATH`: override the managed server registry JSON path.
@@ -148,15 +156,22 @@ surface, not as a raw terminal stream.
   `opencode_coder_wait` to block for meaningful changes. Fall back to compact
   `opencode_coder_status(job_id, wait_seconds=...)` only when wait is unavailable or
   cursor/delta diagnostics are needed.
+- For wait-only usage, configure the MCP client timeout to `300` seconds and set
+  `OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS=300` with the default `25` second
+  margin. This gives an effective wait cap of about `275` seconds, which better
+  covers long first-change gaps. The default 240-second client timeout remains
+  usable, but it caps waits around `215` seconds and may require one extra
+  `wait_timeout` cycle before the first meaningful update.
 - Use `caller_update_recommended`, `caller_update_reason`, and
   `next_poll_after_seconds` to avoid noisy user updates. Dispatch a lightweight
-  wait first: `opencode_coder_wait(job_id, wait_seconds=120, return_on="interesting",
-  include_status=false)` only returns `job_id`, `status`, and wait outcome fields.
-  When the wait signals an interesting update (e.g. terminal status, first change,
-  stall, policy violation), call `opencode_coder_status(job_id)` to get the full
-  diagnostic snapshot. Continue with `opencode_coder_wait` for ordinary running
-  jobs. Normal status checks or user-facing updates should use a 120-second-or-longer
-  cadence. `next_poll_after_seconds` for terminal/not_found/abnormal phases
+  wait first: `opencode_coder_wait(job_id, return_on="interesting",
+  include_status=false)`. It returns a compact snapshot with status, changed files,
+  risk fields, progress fields, validation summary, and wait guidance. Do not call
+  `opencode_coder_status` after every wait by default; call status only when
+  `needs_status_refresh=true`, when cursor/delta diagnostics are needed, or when you
+  explicitly enabled tail/debug output. Continue with `opencode_coder_wait` for
+  ordinary running jobs. Normal status checks or user-facing updates should use a
+  120-second-or-longer cadence. `next_poll_after_seconds` for terminal/not_found/abnormal phases
   defaults to `0`; ordinary running phases recommend `120`. Treat
   `next_poll_after_seconds` as a status-fallback diagnostic hint, not as the
   normal wait cadence. Normal running jobs can stay silent while still reporting
@@ -182,7 +197,8 @@ surface, not as a raw terminal stream.
 ### `opencode_coder`
 
 Runs `opencode run --format json --dangerously-skip-permissions <prompt>` in a target
-working directory.
+working directory. By default the wrapper adds
+`--model deepseek/deepseek-v4-pro --variant max`; callers can override these per job.
 
 Parameters:
 
@@ -204,6 +220,13 @@ Parameters:
 - `continue_last`: optional flag to pass `--continue`.
 - `fork_session`: optional flag to pass `--fork`.
 - `title`: optional task title to pass with `--title`.
+- `model`: optional OpenCode model passed as `--model`. Defaults to
+  `deepseek/deepseek-v4-pro`; pass `null` or an empty string to omit the flag.
+- `variant`: optional OpenCode variant passed as `--variant`. Defaults to `max`;
+  pass `null` or an empty string to omit the flag.
+- `agent`: optional OpenCode agent passed as `--agent`. Omitted by default.
+- `show_thinking`: optional schema parameter. When `true`, the wrapper passes the
+  OpenCode CLI flag `--thinking`. Defaults to `false`.
 - `include_tail`: optional debug flag. Defaults to `false`, so the result keeps
   `stdout_tail` / `stderr_tail` empty.
 - `include_output`: optional compatibility/debug flag. Defaults to `false`, so the
@@ -216,10 +239,13 @@ Parameters:
   `include_delta=true`.
 - `tail_max_chars`: optional tail/output character cap when tail/output are enabled.
 
-`timeout_seconds` is capped by `OPENCODE_CODER_MAX_WAIT_SECONDS` to avoid the MCP
-client timing out before the wrapper can return job context. The default cap is
-`110` seconds. Returned results include both `requested_timeout_seconds` and
-`effective_timeout_seconds`.
+`timeout_seconds` is capped to avoid the MCP client timing out before the wrapper can
+return job context. The default cap is derived from the MCP client timeout budget
+minus the safety margin. With built-in defaults this is `215` seconds (`240 - 25`).
+For wait-only usage, prefer configuring the MCP client and
+`OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS` to `300`, which yields an effective cap
+of about `275` seconds. Returned results include both `requested_timeout_seconds`
+and `effective_timeout_seconds`.
 
 Wait policies:
 
@@ -234,14 +260,17 @@ Wait policies:
 
 For long-running coding tasks, prefer `"start_only"` or `"first_output"` so the
 caller can regain control quickly, then use lightweight `opencode_coder_wait(...,
-include_status=false)` for long polling. Call `opencode_coder_status` only when the
-wait reports an interesting update or when full diagnostics are needed.
+include_status=false)` for long polling. Call `opencode_coder_status` only when
+`needs_status_refresh=true`, raw cursor/delta diagnostics are needed, or you are
+debugging tail/output.
 
 By default, `opencode_coder` returns compact work feedback: `status`, `success`,
 `suggested_action`, `summary`, `work_summary_text` / `last_text_output`,
 changed-file lists, risk fields, lightweight diagnostics, and cursor metadata. It
 does not return raw OpenCode stdout/stderr tails, stdout JSON event streams, delta
 text, or legacy `output` unless the caller explicitly enables the debug flags above.
+The result also records `requested_model`, `requested_variant`, `requested_agent`,
+and `requested_show_thinking`.
 
 When `server_id` is omitted, `opencode_coder` keeps the original direct
 `opencode run` behavior. When `server_id` is provided, it runs through an attached
@@ -267,6 +296,10 @@ Job results also include:
 - `attached_to_server`
 - `server_recovered_from_registry`
 - `wait_policy`
+- `requested_model`
+- `requested_variant`
+- `requested_agent`
+- `requested_show_thinking`
 - `first_output_at`
 - `first_change_at`
 - `last_activity_at`
@@ -707,10 +740,14 @@ meaningful change or the wait window expires. This reduces token waste from freq
 Parameters:
 
 - `job_id`: job returned by `opencode_coder`.
-- `wait_seconds`: maximum wait time, clamped to `0..600` seconds. Defaults to `120`.
-  The upper bound is conservative to avoid extreme MCP tool call timeouts while still
-  allowing bulk polling. Longer waits should be split into multiple
-  `opencode_coder_wait` calls or mixed with `opencode_coder_status` queries.
+- `wait_seconds`: requested maximum wait time, first clamped to `0..600` seconds and
+  then capped by the MCP client timeout budget. With built-in defaults the effective
+  cap is `215` seconds (`240` second client timeout minus a `25` second margin). For
+  wait-only usage, configure the MCP client timeout to `300` seconds and set
+  `OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS=300`, which yields an effective cap of
+  about `275` seconds. If `OPENCODE_CODER_MAX_WAIT_SECONDS` is set, that explicit
+  value is the final cap.
+  Longer waits should be split into multiple `opencode_coder_wait` calls.
 - `return_on`: what kind of event triggers a return. Options:
   - `"interesting"` (default): return when `caller_update_recommended=true`, the job
     reaches a terminal status, the first file change appears, a policy violation is
@@ -722,14 +759,14 @@ Parameters:
     the job does not reach a terminal state, returns with `wait_timeout`.
 - `include_status`: defaults to `true`. When true, returns the full job status result
   (same shape as `opencode_coder_status`) plus wait-specific fields. When false,
-  returns only `job_id`, `status`, and wait-specific fields. Lightweight polling
-  should use `include_status=false` to save tokens; call `opencode_coder_status` only
-  when the wait returns an interesting update.
+  returns a compact snapshot with the key status/risk/progress/validation fields plus
+  wait-specific fields. Lightweight polling should use `include_status=false` to save
+  tokens; call `opencode_coder_status` only when `needs_status_refresh=true`, raw
+  cursor/delta diagnostics are needed, or tail/debug output is being investigated.
 - `include_tail`, `include_output`, `include_delta`: debug flags, same as
   `opencode_coder_status`. All default to `false` for compact output.
 
-Returned wait-specific fields (present in addition to status fields when
-`include_status=true`, or standalone when `include_status=false`):
+Returned wait-specific fields:
 
 - `wait_return_reason`: why the wait returned. Possible values:
   - `terminal_status` — job reached completed/failed/cancelled.
@@ -744,11 +781,33 @@ Returned wait-specific fields (present in addition to status fields when
 - `interesting_update`: `true` if a meaningful change was detected; `false` when the
   wait timed out with no new signal.
 - `waited_seconds`: actual time spent waiting, in seconds.
+- `requested_wait_seconds`: parsed and `0..600`-clamped wait request.
+- `effective_wait_seconds`: actual maximum wait window after MCP timeout/margin cap.
+- `wait_timeout_policy`: whether the wait used the requested value or was capped by
+  the wrapper before the MCP client timeout.
+- `needs_status_refresh`: `true` only when the compact wait response should be
+  followed by `opencode_coder_status`, such as debug/tail usage, inconsistent status,
+  forced git snapshot refresh needs, or insufficient risk diagnostics. Normal
+  completed, first-change, validation-observed, policy-violation, stalled, and timeout
+  responses should usually be self-contained.
+- `suggested_next_tool`: next tool hint such as `opencode_coder_wait`,
+  `opencode_coder_diff`, `opencode_coder_cancel`, `opencode_coder_status`, or `none`.
+- `status_refresh_reason`: why status refresh is or is not recommended. Ordinary
+  self-contained wait responses use `compact_snapshot_sufficient`.
+
+With `include_status=false`, the compact snapshot includes at least `status`,
+`success`, `error`, `job_id`, `working_dir`, `exit_code`, `summary`,
+`work_summary_text`, `assistant_last_text`, `last_text_output`, changed-file lists,
+policy fields, validation fields, progress fields, stall/no-op fields, and
+`suggested_action`.
 
 When the wait times out (`wait_return_reason="wait_timeout"`, `interesting_update=false`),
 the returned result is a compact heartbeat: the job may still be running,
 `caller_update_recommended` is likely `false`, and raw tail/delta/output is empty
 by default.
+In a wait-only loop, callers should normally continue with another
+`opencode_coder_wait` after this compact heartbeat instead of reporting to the user or
+fetching status.
 
 If `job_id` is not found, `wait` returns immediately with `wait_return_reason="not_found"`
 and `waited_seconds=0.0`. It does not block.
@@ -762,6 +821,8 @@ Differences from `opencode_coder_status`:
   one MCP tool call.
 - `opencode_coder_wait` does not support stdout/stderr cursor parameters; use
   `opencode_coder_status` for cursor-based delta polling.
+- Prefer another `opencode_coder_wait` after ordinary wait responses. Do not fetch
+  status immediately unless `needs_status_refresh=true` or you need raw diagnostics.
 - `opencode_coder_wait` is not an MCP push notification — it blocks the calling
   conversation until it returns.
 
@@ -1111,8 +1172,9 @@ New callers should prefer `status`, `exit_code`, `stdout_cursor` /
 `stderr_cursor`, `suggested_action`, `work_summary_text`, `new_changed_files`, risk
 fields, and `opencode_coder_diff`.
 For normal observation loops, prefer lightweight `opencode_coder_wait(...,
-include_status=false)` and fetch compact `opencode_coder_status` only after an
-interesting update or when full diagnostics are needed. `stdout_delta` /
+include_status=false)` and fetch compact `opencode_coder_status` only when
+`needs_status_refresh=true`, raw cursor/delta diagnostics are needed, or tail/debug
+output is being investigated. `stdout_delta` /
 `stderr_delta` and `recent_events` are debug diagnostics, not the normal calling
 contract. Tail fields are bounded by line and character limits, but neither tool
 includes them unless `include_tail=true`. Legacy `output` is also empty unless

@@ -28,6 +28,10 @@ def fake_command(
     continue_last: bool = False,
     fork_session: bool = False,
     title: str | None = None,
+    model: str | None = server.DEFAULT_OPENCODE_MODEL,
+    variant: str | None = server.DEFAULT_OPENCODE_VARIANT,
+    agent: str | None = None,
+    show_thinking: bool = False,
 ) -> list[str]:
     FAKE_BUILD_CALLS.append(
         {
@@ -38,6 +42,10 @@ def fake_command(
             "continue_last": continue_last,
             "fork_session": fork_session,
             "title": title,
+            "model": model,
+            "variant": variant,
+            "agent": agent,
+            "show_thinking": show_thinking,
         }
     )
     if prompt == "short":
@@ -719,7 +727,37 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["attached_to_server"])
         self.assertIsNone(result["server_id"])
         self.assertIsNone(result["server_url"])
+        self.assertEqual(result["requested_model"], server.DEFAULT_OPENCODE_MODEL)
+        self.assertEqual(result["requested_variant"], server.DEFAULT_OPENCODE_VARIANT)
+        self.assertIsNone(result["requested_agent"])
+        self.assertFalse(result["requested_show_thinking"])
         self.assertIsNone(FAKE_BUILD_CALLS[-1]["server_url"])
+        self.assertEqual(FAKE_BUILD_CALLS[-1]["model"], server.DEFAULT_OPENCODE_MODEL)
+        self.assertEqual(FAKE_BUILD_CALLS[-1]["variant"], server.DEFAULT_OPENCODE_VARIANT)
+        self.assertIsNone(FAKE_BUILD_CALLS[-1]["agent"])
+        self.assertFalse(FAKE_BUILD_CALLS[-1]["show_thinking"])
+
+    def test_coder_records_explicit_model_variant_agent_and_thinking(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            result = server.opencode_coder(
+                "short",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                model="openai/gpt-5",
+                variant="fast",
+                agent="coder",
+                show_thinking=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["requested_model"], "openai/gpt-5")
+        self.assertEqual(result["requested_variant"], "fast")
+        self.assertEqual(result["requested_agent"], "coder")
+        self.assertTrue(result["requested_show_thinking"])
+        self.assertEqual(FAKE_BUILD_CALLS[-1]["model"], "openai/gpt-5")
+        self.assertEqual(FAKE_BUILD_CALLS[-1]["variant"], "fast")
+        self.assertEqual(FAKE_BUILD_CALLS[-1]["agent"], "coder")
+        self.assertTrue(FAKE_BUILD_CALLS[-1]["show_thinking"])
 
     def test_coder_include_tail_and_output_returns_debug_fields(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -1401,6 +1439,47 @@ class OpenCodeCoderTests(unittest.TestCase):
         else:
             self.assertTrue(kwargs["start_new_session"])
 
+    def test_build_command_uses_default_model_and_variant(self):
+        command = self.original_build_command("prompt")
+
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "deepseek/deepseek-v4-pro")
+        self.assertIn("--variant", command)
+        self.assertEqual(command[command.index("--variant") + 1], "max")
+        self.assertNotIn("--agent", command)
+        self.assertNotIn("--show" + "-thinking", command)
+        self.assertNotIn("--thinking", command)
+
+    def test_build_command_supports_explicit_model_variant_agent_and_thinking(self):
+        command = self.original_build_command(
+            "prompt",
+            model="openai/gpt-5",
+            variant="fast",
+            agent="coder",
+            show_thinking=True,
+        )
+
+        self.assertEqual(command[command.index("--model") + 1], "openai/gpt-5")
+        self.assertEqual(command[command.index("--variant") + 1], "fast")
+        self.assertEqual(command[command.index("--agent") + 1], "coder")
+        self.assertIn("--thinking", command)
+        self.assertNotIn("--show" + "-thinking", command)
+
+    def test_build_command_skips_empty_model_variant_agent_and_thinking(self):
+        command = self.original_build_command(
+            "prompt",
+            model="",
+            variant=None,
+            agent="",
+            show_thinking=False,
+        )
+
+        self.assertNotIn("--model", command)
+        self.assertNotIn("--variant", command)
+        self.assertNotIn("--agent", command)
+        self.assertNotIn("--show" + "-thinking", command)
+        self.assertNotIn("--thinking", command)
+
     def test_build_command_supports_attach_session_and_title_flags(self):
         command = self.original_build_command(
             "prompt",
@@ -1423,6 +1502,77 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertIn("--fork", command)
         self.assertIn("--title", command)
         self.assertIn("Task Title", command)
+
+    def test_effective_timeout_uses_client_timeout_margin_env(self):
+        original_max_wait = os.environ.pop("OPENCODE_CODER_MAX_WAIT_SECONDS", None)
+        original_client_timeout = os.environ.get("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS")
+        original_margin = os.environ.get("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS")
+        os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = "240"
+        os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = "30"
+        try:
+            requested, effective, policy = server.compute_effective_timeout(500)
+        finally:
+            if original_max_wait is not None:
+                os.environ["OPENCODE_CODER_MAX_WAIT_SECONDS"] = original_max_wait
+            if original_client_timeout is None:
+                os.environ.pop("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = original_client_timeout
+            if original_margin is None:
+                os.environ.pop("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS", None)
+            else:
+                os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = original_margin
+
+        self.assertEqual(requested, 500)
+        self.assertEqual(effective, 210)
+        self.assertIn("capped_by_wrapper", policy)
+
+    def test_effective_wait_caps_explicit_wait_by_default_mcp_budget(self):
+        original_max_wait = os.environ.pop("OPENCODE_CODER_MAX_WAIT_SECONDS", None)
+        original_client_timeout = os.environ.get("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS")
+        original_margin = os.environ.get("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS")
+        os.environ.pop("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS", None)
+        os.environ.pop("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS", None)
+        try:
+            requested, effective, policy = server.compute_effective_wait_wait_seconds(600)
+        finally:
+            if original_max_wait is not None:
+                os.environ["OPENCODE_CODER_MAX_WAIT_SECONDS"] = original_max_wait
+            if original_client_timeout is not None:
+                os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = original_client_timeout
+            if original_margin is not None:
+                os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = original_margin
+
+        self.assertEqual(requested, 600)
+        self.assertEqual(effective, 215)
+        self.assertIn("capped_by_wrapper", policy)
+
+    def test_effective_wait_uses_explicit_max_wait_as_final_cap(self):
+        original_max_wait = os.environ.get("OPENCODE_CODER_MAX_WAIT_SECONDS")
+        original_client_timeout = os.environ.get("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS")
+        original_margin = os.environ.get("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS")
+        os.environ["OPENCODE_CODER_MAX_WAIT_SECONDS"] = "0.15"
+        os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = "240"
+        os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = "25"
+        try:
+            requested, effective, policy = server.compute_effective_wait_wait_seconds(600)
+        finally:
+            if original_max_wait is None:
+                os.environ.pop("OPENCODE_CODER_MAX_WAIT_SECONDS", None)
+            else:
+                os.environ["OPENCODE_CODER_MAX_WAIT_SECONDS"] = original_max_wait
+            if original_client_timeout is None:
+                os.environ.pop("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = original_client_timeout
+            if original_margin is None:
+                os.environ.pop("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS", None)
+            else:
+                os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = original_margin
+
+        self.assertEqual(requested, 600)
+        self.assertEqual(effective, 0.15)
+        self.assertIn("capped_by_wrapper", policy)
 
     def test_attached_coder_passes_server_url_and_parses_session_id(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -2821,6 +2971,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_return_reason"], "not_found")
         self.assertTrue(result["interesting_update"])
         self.assertEqual(result["waited_seconds"], 0.0)
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "none")
+        self.assertEqual(result["status_refresh_reason"], "compact_snapshot_sufficient")
 
     def test_wait_running_no_change_times_out_compact(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -2845,11 +2998,57 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertFalse(result["interesting_update"])
         self.assertGreater(result["waited_seconds"], 0.0)
         self.assertIn(result["status"], {"running", "timed_out"})
+        self.assertIn("working_dir", result)
+        self.assertIn("suggested_action", result)
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "opencode_coder_wait")
         self.assertEqual(result["stdout_tail"], "")
         self.assertEqual(result["stderr_tail"], "")
         self.assertEqual(result["stdout_delta"], "")
         self.assertEqual(result["stderr_delta"], "")
         self.assertEqual(result["output"], "")
+
+    def test_wait_caps_explicit_long_wait_by_mcp_margin(self):
+        original_max_wait = os.environ.pop("OPENCODE_CODER_MAX_WAIT_SECONDS", None)
+        original_client_timeout = os.environ.get("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS")
+        original_margin = os.environ.get("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS")
+        os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = "0.3"
+        os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = "0.1"
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "no_output_long",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            try:
+                started_at = time.monotonic()
+                result = server.opencode_coder_wait(
+                    initial["job_id"],
+                    wait_seconds=600,
+                    return_on="interesting",
+                    include_status=False,
+                )
+                elapsed = time.monotonic() - started_at
+            finally:
+                server.opencode_coder_cancel(initial["job_id"])
+                if original_max_wait is not None:
+                    os.environ["OPENCODE_CODER_MAX_WAIT_SECONDS"] = original_max_wait
+                if original_client_timeout is None:
+                    os.environ.pop("OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS", None)
+                else:
+                    os.environ["OPENCODE_CODER_MCP_CLIENT_TIMEOUT_SECONDS"] = original_client_timeout
+                if original_margin is None:
+                    os.environ.pop("OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS", None)
+                else:
+                    os.environ["OPENCODE_CODER_MCP_WAIT_MARGIN_SECONDS"] = original_margin
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result["wait_return_reason"], "wait_timeout")
+        self.assertEqual(result["requested_wait_seconds"], 600)
+        self.assertAlmostEqual(result["effective_wait_seconds"], 0.2)
+        self.assertIn("capped_by_wrapper", result["wait_timeout_policy"])
+        self.assertGreaterEqual(result["waited_seconds"], 0.15)
 
     def test_wait_terminal_returns_on_completion(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -2871,6 +3070,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_return_reason"], "terminal_status")
         self.assertTrue(result["interesting_update"])
         self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "none")
+        self.assertEqual(result["status_refresh_reason"], "compact_snapshot_sufficient")
 
     def test_wait_interesting_returns_on_completion(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -2892,12 +3094,14 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_return_reason"], "terminal_status")
         self.assertTrue(result["interesting_update"])
         self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "none")
 
     def test_wait_first_change_returns_immediately(self):
         with tempfile.TemporaryDirectory() as working_dir:
             init_git_repo(working_dir)
             initial = server.opencode_coder(
-                "delayed_write:src/changed.txt",
+                "double_write_same_file:src/changed.txt",
                 working_dir=working_dir,
                 timeout_seconds=2,
                 wait_policy="start_only",
@@ -2916,6 +3120,9 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_return_reason"], "first_change_seen")
         self.assertTrue(result["interesting_update"])
         self.assertEqual(result["new_changed_files"], ["src/changed.txt"])
+        self.assertFalse(result["needs_status_refresh"])
+        expected_next = "opencode_coder_diff" if result["status"] == "completed" else "opencode_coder_wait"
+        self.assertEqual(result["suggested_next_tool"], expected_next)
 
     def test_wait_terminal_without_completion_times_out(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -2938,8 +3145,10 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(result["wait_return_reason"], "wait_timeout")
         self.assertFalse(result["interesting_update"])
         self.assertGreater(result["waited_seconds"], 0.0)
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "opencode_coder_wait")
 
-    def test_wait_include_status_false_returns_minimal(self):
+    def test_wait_include_status_false_returns_compact_snapshot(self):
         with tempfile.TemporaryDirectory() as working_dir:
             initial = server.opencode_coder(
                 "no_output_long",
@@ -2956,12 +3165,50 @@ class OpenCodeCoderTests(unittest.TestCase):
             server.opencode_coder_cancel(initial["job_id"])
 
         self.assertIn(result["status"], {"running", "timed_out"})
-        self.assertIn("wait_return_reason", result)
-        self.assertIn("interesting_update", result)
-        self.assertIn("waited_seconds", result)
-        self.assertNotIn("working_dir", result)
+        required_fields = [
+            "status",
+            "success",
+            "error",
+            "job_id",
+            "working_dir",
+            "exit_code",
+            "summary",
+            "work_summary_text",
+            "assistant_last_text",
+            "last_text_output",
+            "new_changed_files",
+            "all_changed_files",
+            "preexisting_changed_files",
+            "policy_violation",
+            "extra_changed_files",
+            "forbidden_changed_files",
+            "validation_status",
+            "validation_note",
+            "observed_validation_summary",
+            "progress_phase",
+            "progress_message",
+            "caller_update_recommended",
+            "caller_update_reason",
+            "next_poll_after_seconds",
+            "is_stalled",
+            "stall_reason",
+            "no_event_noop_risk",
+            "suggested_action",
+            "wait_return_reason",
+            "interesting_update",
+            "waited_seconds",
+            "requested_wait_seconds",
+            "effective_wait_seconds",
+            "wait_timeout_policy",
+            "needs_status_refresh",
+            "suggested_next_tool",
+            "status_refresh_reason",
+        ]
+        for field in required_fields:
+            self.assertIn(field, result)
         self.assertNotIn("stdout_tail", result)
-        self.assertNotIn("new_changed_files", result)
+        self.assertNotIn("stderr_tail", result)
+        self.assertNotIn("output", result)
 
     def test_wait_clamp_helper(self):
         self.assertEqual(server.clamp_wait_wait_seconds(-1), 0.0)
@@ -2969,7 +3216,7 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertEqual(server.clamp_wait_wait_seconds(700), server.MAX_WAIT_WAIT_SECONDS)
         self.assertEqual(server.clamp_wait_wait_seconds("not-a-number"), server.DEFAULT_WAIT_WAIT_SECONDS)
         self.assertEqual(server.clamp_wait_wait_seconds(None), server.DEFAULT_WAIT_WAIT_SECONDS)
-        self.assertEqual(server.DEFAULT_WAIT_WAIT_SECONDS, 120.0)
+        self.assertEqual(server.DEFAULT_WAIT_WAIT_SECONDS, 215.0)
 
     def test_next_poll_after_seconds_no_short_poll_for_running_phases(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -3069,14 +3316,17 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertTrue(status["success"])
         self.assertEqual(status["exit_code"], 0)
 
-    def test_wait_not_found_with_include_status_false_returns_minimal(self):
+    def test_wait_not_found_with_include_status_false_returns_compact_snapshot(self):
         result = server.opencode_coder_wait("missing-job", wait_seconds=5, include_status=False)
 
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["wait_return_reason"], "not_found")
         self.assertTrue(result["interesting_update"])
         self.assertEqual(result["waited_seconds"], 0.0)
-        self.assertNotIn("working_dir", result)
+        self.assertIn("working_dir", result)
+        self.assertIsNone(result["working_dir"])
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "none")
 
     def test_wait_does_not_return_stale_first_change_seen(self):
         with tempfile.TemporaryDirectory() as working_dir:
@@ -3150,6 +3400,80 @@ class OpenCodeCoderTests(unittest.TestCase):
         self.assertLess(elapsed, 1.5)
         self.assertEqual(result["wait_return_reason"], "terminal_status")
         self.assertTrue(result["interesting_update"])
+        self.assertFalse(result["needs_status_refresh"])
+
+    def test_wait_policy_violation_guidance_prefers_diff_not_status(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            init_git_repo(working_dir)
+            initial = server.opencode_coder(
+                "write_then_sleep:forbidden.txt",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+                forbidden_paths=["forbidden.txt"],
+            )
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+            )
+            server.opencode_coder_cancel(initial["job_id"])
+
+        self.assertEqual(result["wait_return_reason"], "policy_violation")
+        self.assertTrue(result["policy_violation"])
+        self.assertEqual(result["forbidden_changed_files"], ["forbidden.txt"])
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "opencode_coder_diff")
+        self.assertEqual(result["status_refresh_reason"], "compact_snapshot_sufficient")
+
+    def test_wait_stalled_guidance_prefers_cancel_without_status_refresh(self):
+        original_no_output = server.STALL_NO_OUTPUT_SECONDS
+        server.STALL_NO_OUTPUT_SECONDS = 0.1
+        try:
+            with tempfile.TemporaryDirectory() as working_dir:
+                initial = server.opencode_coder(
+                    "no_output_long",
+                    working_dir=working_dir,
+                    timeout_seconds=2,
+                    wait_policy="start_only",
+                )
+                result = server.opencode_coder_wait(
+                    initial["job_id"],
+                    wait_seconds=1,
+                    return_on="interesting",
+                    include_status=False,
+                )
+                server.opencode_coder_cancel(initial["job_id"])
+        finally:
+            server.STALL_NO_OUTPUT_SECONDS = original_no_output
+
+        self.assertEqual(result["wait_return_reason"], "stalled")
+        self.assertTrue(result["is_stalled"])
+        self.assertEqual(result["stall_reason"], "no_output_no_change_after_start")
+        self.assertFalse(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "opencode_coder_cancel")
+
+    def test_wait_debug_output_requests_status_refresh(self):
+        with tempfile.TemporaryDirectory() as working_dir:
+            initial = server.opencode_coder(
+                "delayed_output",
+                working_dir=working_dir,
+                timeout_seconds=2,
+                wait_policy="start_only",
+            )
+            result = server.opencode_coder_wait(
+                initial["job_id"],
+                wait_seconds=2,
+                return_on="interesting",
+                include_status=False,
+                include_tail=True,
+            )
+
+        self.assertEqual(result["wait_return_reason"], "terminal_status")
+        self.assertTrue(result["needs_status_refresh"])
+        self.assertEqual(result["suggested_next_tool"], "opencode_coder_status")
+        self.assertEqual(result["status_refresh_reason"], "debug_output_requested")
 
 
 class OpenCodeCoderIntegrationTests(unittest.TestCase):
